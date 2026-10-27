@@ -1,0 +1,15 @@
+[project]
+name = "kvit"
+version = "0.1.0"
+description = "Position-independent KV caching of local Git repo spans on a patched vLLM"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+# fastapi, httpx, transformers and uvicorn come with the patched vLLM
+dependencies = ["fastapi", "httpx", "transformers", "uvicorn"]
+
+[project.scripts]
+kvit = "kvit.proxy:main"
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
