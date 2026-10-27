@@ -1,0 +1,64 @@
+# KVIT
+
+KVIT runs a local vLLM that caches the KV of spans, such as files from a local Git
+repository, and reuses them at any position in later prompts (position-independent
+caching, PIC). Spans that show up again in a different order or after a different
+prefix are not prefilled again; only a small set of blocks per span is recomputed
+to repair cross-span attention.
+
+The engine changes live in `patches/vllm-pic.patch`. They touch the scheduler, the
+KV-cache manager, the Triton attention backend, RoPE handling and the model runner,
+so they cannot be shipped as a vLLM plugin.
+
+## Pinned versions
+
+| | |
+|---|---|
+| Upstream vLLM | [`a7fdfeef72323eb3db6f0620e4ea200290d0ca5a`](https://github.com/vllm-project/vllm/commit/a7fdfeef72323eb3db6f0620e4ea200290d0ca5a) (between v0.23.0 and v0.24.0rc1) |
+| Patch source | development fork, branch `feature/spanfuse` at `21c565ffce30` |
+
+The patch only applies to that commit. Other vLLM versions are untested.
+
+## Install
+
+Needs a CUDA machine, `git` and [`uv`](https://docs.astral.sh/uv/), inside an
+activated virtualenv.
+
+```bash
+git clone https://github.com/kvit-project/kvit.git
+cd kvit
+./scripts/install-vllm.sh
+```
+
+This clones vLLM into `build/vllm`, applies the patch and installs it in editable
+mode with the prebuilt upstream kernels.
+
+## Run
+
+```bash
+VLLM_V1_SPANS_ENABLED=True \
+VLLM_V1_SPANS_SPANFUSE_ENABLE=True \
+VLLM_USE_V2_MODEL_RUNNER=0 \
+vllm serve <model> --attention-backend TRITON_ATTN --block-size 16 \
+  --enable-prefix-caching --no-async-scheduling
+```
+
+The PIC path lives in the V1 GPU model runner and the Triton attention backend,
+so both are required. Other repair policies are selected with
+`--gap-policy-name` (`span_aware`, `qcfuse`, `neighbor_aware`, `spanfuse`).
+All knobs are `VLLM_V1_SPANS_*` environment variables, documented in
+`build/vllm/vllm/envs.py`. The PIC tests run with
+`build/vllm/scripts/run_spans_tests.sh`.
+
+## Regenerating the patch
+
+From a clone of the development fork:
+
+```bash
+git diff --binary a7fdfeef72323eb3db6f0620e4ea200290d0ca5a <branch> > patches/vllm-pic.patch
+```
+
+## License
+
+Apache-2.0, same as vLLM. The patch modifies code from the
+[vLLM project](https://github.com/vllm-project/vllm).
