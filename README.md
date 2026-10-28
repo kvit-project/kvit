@@ -1,6 +1,6 @@
-# KVIT
+# KVit
 
-KVIT runs a local vLLM that caches the KV of the parts of a local Git repository
+KVit runs a local vLLM that caches the KV of the parts of a local Git repository
 an agent reads, and reuses them at any position in later prompts
 (position-independent caching, PIC). A file slice that shows up again in a
 different order or after a different prefix is not prefilled again; only a small
