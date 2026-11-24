@@ -1524,10 +1524,10 @@ index 3be24d7fb3..9160720bac 100644
 +    assert span1.pd_block_hashes[0] == head.pd_block_hashes[0]
 +    assert span1.pd_block_hashes[1] != head.pd_block_hashes[1]
 diff --git a/tests/v1/core/test_prefix_caching.py b/tests/v1/core/test_prefix_caching.py
-index b0be55bb49..e69761da61 100644
+index b0be55bb49..20ee3553fd 100644
 --- a/tests/v1/core/test_prefix_caching.py
 +++ b/tests/v1/core/test_prefix_caching.py
-@@ -3903,3 +3903,88 @@ def test_pure_swa_retention_dense_default_caches_all(monkeypatch):
+@@ -3903,3 +3903,105 @@ def test_pure_swa_retention_dense_default_caches_all(monkeypatch):
          is not None
      }
      assert cached == set(range(16))
@@ -1616,6 +1616,23 @@ index b0be55bb49..e69761da61 100644
 +    req_blocks = manager.coordinator.single_type_managers[0].req_to_blocks["probe"]
 +    assert req_blocks[1] is copy_ and copy_.block_hash is None
 +    assert manager.block_pool.get_cached_block(probe.pd_block_hashes[1], [0]) is None
++
++
++def test_pin_blocks_survive_eviction(monkeypatch):
++    """SPANS: pinned shared span blocks keep their hash when the pool is drained,
++    and the pinned share of the pool is capped."""
++    monkeypatch.setenv("VLLM_V1_SPANS_PIN_FRACTION", "0.5")
++    pool = BlockPool(num_gpu_blocks=9, enable_caching=True, hash_block_size=4)
++    req = make_request("0", list(range(24)), 4, sha256)
++    blocks = pool.get_new_blocks(6)
++    pool.cache_blocks_under_hashes(blocks, req.block_hashes[:6], 0)
++    # cap = int(0.5 * 8) = 4 of the 6 offered
++    assert pool.pin_blocks(blocks) == 4 and pool.pin_blocks(blocks) == 0
++    pool.free_blocks(blocks)
++    assert pool.get_num_free_blocks() == 4
++    pool.get_new_blocks(4)
++    assert [b.block_hash is not None for b in blocks] == [True] * 4 + [False] * 2
++    assert pool.get_cached_block(req.block_hashes[0], [0]) == [blocks[0]]
 diff --git a/tests/v1/determinism/test_router_gemm_batch_invariant.py b/tests/v1/determinism/test_router_gemm_batch_invariant.py
 new file mode 100644
 index 0000000000..25d1538200
@@ -3364,10 +3381,10 @@ index 1f7296cdaa..b2fc052d70 100644
          self,
          request: ChatCompletionRequest,
 diff --git a/vllm/envs.py b/vllm/envs.py
-index 10f8fef4a7..d313306e6d 100755
+index 10f8fef4a7..4777f79cc9 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -258,6 +258,34 @@ if TYPE_CHECKING:
+@@ -258,6 +258,35 @@ if TYPE_CHECKING:
      VLLM_USE_V2_MODEL_RUNNER: bool | None = None
      VLLM_LOG_MODEL_INSPECTION: bool = False
      VLLM_DEBUG_MFU_METRICS: bool = False
@@ -3391,6 +3408,7 @@ index 10f8fef4a7..d313306e6d 100755
 +    VLLM_V1_SPANS_SPANFUSE_NORM_CHECK: bool = False
 +    VLLM_V1_SPANS_SPANFUSE_ANCHOR_BLOCKS: int = 1
 +    VLLM_V1_SPANS_SPANFUSE_SEED: bool = False
++    VLLM_V1_SPANS_PIN_FRACTION: float = 0.0
 +    VLLM_V1_SPANS_SHIFT_DUMP: str = ""
 +    VLLM_V1_SPANS_LB_NOCLIP: bool = False
 +    VLLM_V1_SPANS_LB_SPILL_LOG: bool = False
@@ -3402,7 +3420,7 @@ index 10f8fef4a7..d313306e6d 100755
      VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
      VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
      VLLM_WSL2_ENABLE_PIN_MEMORY: bool = False
-@@ -1689,6 +1717,96 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -1689,6 +1718,100 @@ environment_variables: dict[str, Callable[[], Any]] = {
      "VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS": lambda: bool(
          int(os.getenv("VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS", "0"))
      ),
@@ -3472,6 +3490,10 @@ index 10f8fef4a7..d313306e6d 100755
 +    # SPANFUSE: a cold span is encoded in its first context and that copy is the shared one
 +    "VLLM_V1_SPANS_SPANFUSE_SEED": lambda: (
 +        os.environ.get("VLLM_V1_SPANS_SPANFUSE_SEED", "False") == "True"
++    ),
++    # SPANS: share of the KV pool shared span blocks hold against eviction (0 = off)
++    "VLLM_V1_SPANS_PIN_FRACTION": lambda: float(
++        os.environ.get("VLLM_V1_SPANS_PIN_FRACTION", "0")
 +    ),
 +    # SPANSHIFT: dump blind and repaired K/V of every gap-swapped block to this dir
 +    "VLLM_V1_SPANS_SHIFT_DUMP": lambda: os.environ.get("VLLM_V1_SPANS_SHIFT_DUMP", ""),
@@ -4572,10 +4594,27 @@ index 0000000000..d32524b4d6
 +def get_capturer() -> QCFuseImportanceCapturer | None:
 +    return _CAPTURER
 diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
-index 4202f52708..1e75e7d1aa 100644
+index 4202f52708..0968899780 100644
 --- a/vllm/v1/core/block_pool.py
 +++ b/vllm/v1/core/block_pool.py
-@@ -208,6 +208,22 @@ class BlockPool:
+@@ -3,6 +3,7 @@
+ from collections.abc import Iterable, Sequence
+ from typing import Any
+ 
++from vllm import envs
+ from vllm.distributed.kv_events import (
+     MEDIUM_GPU,
+     AllBlocksCleared,
+@@ -180,6 +181,8 @@ class BlockPool:
+         self.kv_event_queue: list[KVCacheEvent] = []
+ 
+         self.metrics_collector = metrics_collector
++        # SPANS: ids of shared span blocks the pool holds a reference on
++        self.pinned_block_ids: set[int] = set()
+ 
+     def get_cached_block(
+         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
+@@ -208,6 +211,48 @@ class BlockPool:
              cached_blocks.append(block)
          return cached_blocks
  
@@ -4595,10 +4634,36 @@ index 4202f52708..1e75e7d1aa 100644
 +            blk.block_hash = block_hash_with_group_id
 +            self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
 +
++    def pin_blocks(self, blocks: Iterable[KVCacheBlock]) -> int:
++        """SPANS: hold one pool reference on shared span blocks, so they never
++        reach the free queue and are never evicted. Returns the number pinned."""
++        # ceiling: pins are never released, so past this share of the pool span
++        # blocks stay evictable; upgrade path is LRU among the pinned blocks
++        cap = int(envs.VLLM_V1_SPANS_PIN_FRACTION * (self.num_gpu_blocks - 1))
++        pinned = 0
++        for blk in blocks:
++            if len(self.pinned_block_ids) >= cap:
++                break
++            if blk.is_null or blk.block_id in self.pinned_block_ids:
++                continue
++            # a duplicate of an already cached hash is never the copy a lookup returns
++            if (
++                blk.block_hash is None
++                or self.cached_block_hash_to_block.get_one_block(blk.block_hash)
++                is not blk
++            ):
++                continue
++            if blk.ref_cnt == 0:
++                self.free_block_queue.remove(blk)
++            blk.ref_cnt += 1
++            self.pinned_block_ids.add(blk.block_id)
++            pinned += 1
++        return pinned
++
      def cache_full_blocks(
          self,
          request: Request,
-@@ -432,8 +448,12 @@ class BlockPool:
+@@ -432,8 +477,12 @@ class BlockPool:
          blocks_list = list(ordered_blocks)
          for block in blocks_list:
              block.ref_cnt -= 1
@@ -5108,10 +5173,10 @@ index d1c652c46e..84672f1fac 100644
  
 diff --git a/vllm/v1/core/sched/gap_policy.py b/vllm/v1/core/sched/gap_policy.py
 new file mode 100644
-index 0000000000..89604cc0c2
+index 0000000000..42fc9e42a0
 --- /dev/null
 +++ b/vllm/v1/core/sched/gap_policy.py
-@@ -0,0 +1,1160 @@
+@@ -0,0 +1,1166 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""
@@ -5429,6 +5494,11 @@ index 0000000000..89604cc0c2
 +            ],
 +            0,
 +        )
++        if seed:
++            pool = sched.kv_cache_manager.block_pool
++            pool.pin_blocks(
++                req_blocks[b] for s, e in spans for b in range(s // bs, e // bs)
++            )
 +        if seed and prefix_exact:
 +            # a block hash shared by two spans here resolves to the first one's copy
 +            n = Counter(request.block_hashes[b] for b in idx)
@@ -5487,6 +5557,7 @@ index 0000000000..89604cc0c2
 +    sched.kv_cache_manager.block_pool.cache_blocks_under_hashes(
 +        [req_blocks[b] for b in idx], [request.block_hashes[b] for b in idx], 0
 +    )
++    sched.kv_cache_manager.block_pool.pin_blocks(req_blocks[b] for b in idx)
 +    logger.info(
 +        "SpanFuse: %d cold spans (%d tokens) warmed on the fly in %s%s",
 +        len(spans),
