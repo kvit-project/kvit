@@ -19,7 +19,7 @@ so they cannot be shipped as a vLLM plugin.
 | | |
 |---|---|
 | Upstream vLLM | [`a7fdfeef72323eb3db6f0620e4ea200290d0ca5a`](https://github.com/vllm-project/vllm/commit/a7fdfeef72323eb3db6f0620e4ea200290d0ca5a) (between v0.23.0 and v0.24.0rc1) |
-| Patch source | development fork, branch `feature/spanfuse` at `21c565ffce30` |
+| Patch source | development fork, branch `feature/spanshift` at `d063708018` |
 
 The patch only applies to that commit. Other vLLM versions are untested.
 

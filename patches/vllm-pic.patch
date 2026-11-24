@@ -541,10 +541,10 @@ index 0000000000..7d7acfc9f4
 +    assert rp.extract_reasoning.called is called
 diff --git a/tests/v1/core/test_gap_policy.py b/tests/v1/core/test_gap_policy.py
 new file mode 100644
-index 0000000000..1c21387cd4
+index 0000000000..1d550a5c18
 --- /dev/null
 +++ b/tests/v1/core/test_gap_policy.py
-@@ -0,0 +1,317 @@
+@@ -0,0 +1,664 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
@@ -659,7 +659,6 @@ index 0000000000..1c21387cd4
 +
 +    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
 +    monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
-+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_PREROTATE", True)
 +    req = make_span_request(160, span_starts=[64])
 +    imp = [0.0] * 160
 +    imp[0] = 100.0  # the sink: exact prefix, never worth recomputing
@@ -674,7 +673,6 @@ index 0000000000..1c21387cd4
 +
 +    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
 +    monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
-+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_PREROTATE", True)
 +    req = make_span_request(160, span_starts=[64])
 +    imp = QCFuseImportanceStore(16).lookup([object() for _ in range(10)], 160)
 +    assert imp == [0.0] * 160
@@ -698,7 +696,6 @@ index 0000000000..1c21387cd4
 +
 +    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
 +    monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
-+    monkeypatch.setattr(envs, "VLLM_V1_SPANS_PREROTATE", True)
 +    monkeypatch.setattr(qcfuse, "_SPANFUSE_QUERY_IDS", [])  # (2)-(4): prompt tail
 +    bs, n_blk, span = 16, 10, [4, 5, 6, 7, 8]
 +
@@ -710,7 +707,7 @@ index 0000000000..1c21387cd4
 +    q = torch.randn(4, 4, 8)
 +    table = torch.arange(n_blk)[None]
 +    cap = QCFuseImportanceCapturer(1, n_blk * bs, "cpu")
-+    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span, n_blk * bs)])
++    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span, n_blk * bs, None)])
 +    cap.capture(q, kv, 2, 0.3)
 +    got = cap.buffer[0].clone()
 +    in_span = torch.zeros(n_blk * bs, dtype=torch.bool)
@@ -720,18 +717,18 @@ index 0000000000..1c21387cd4
 +    assert torch.isclose(got.sum(), torch.tensor(4.0 * 2))
 +    kv2 = kv.clone()
 +    kv2[0, :4] = torch.randn_like(kv2[0, :4])
-+    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span, n_blk * bs)])
++    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span, n_blk * bs, None)])
 +    cap.capture(q, kv2, 2, 0.3)
 +    assert torch.allclose(cap.buffer[0], got)
-+    cap.begin_step(table, [(0, 0, 4, n_blk * bs, None, n_blk * bs)])
++    cap.begin_step(table, [(0, 0, 4, n_blk * bs, None, n_blk * bs, None)])
 +    cap.capture(q, kv, 2, 0.3)
 +    full = cap.buffer[0][in_span]
 +    # same rows, one shared normalizer per row: per-row rankings are identical
 +    top = lambda m: m.topk(8).indices.sort().values
 +    assert torch.equal(top(full), top(got[in_span]))
 +
-+    # SPANS caches K unrotated: the probe must rotate it to its absolute
-+    # position (as the kernel does for lb=0 rows) before scoring rotated Q
++    # SPANS caches K at p - L: the probe rotates it back by L (here L = p, K
++    # cached at 0) before scoring Q; the query rows sit at L = 0
 +    hd, rot = 8, 6
 +    inv = 1.0 / (10000 ** (torch.arange(0, rot, 2).float() / rot))
 +    ang = torch.arange(n_blk * bs).float()[:, None] * inv
@@ -743,17 +740,18 @@ index 0000000000..1c21387cd4
 +    )
 +    k_rot = torch.cat((z.real, z.imag, k[..., rot:hd]), -1)
 +    pos = torch.cat([torch.arange(b * bs, (b + 1) * bs) for b in span])
++    lk = torch.cat((torch.arange(n_blk * bs), torch.zeros(4, dtype=torch.long)))
 +    want = QCFuseImportanceCapturer._mass(q.view(4, 2, 2, hd).mean(2), k_rot[pos], 0.3)
-+    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span, n_blk * bs)])
++    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span, n_blk * bs, lk)])
 +    cap.capture(q, kv, 2, 0.3, cos_sin, rot)
 +    assert torch.allclose(cap.buffer[0][pos], want, atol=1e-5)
 +    assert not torch.allclose(got[pos], want, atol=1e-3)
-+    cap.begin_step(table, [(0, 0, 4, n_blk * bs, None, n_blk * bs)])
++    cap.begin_step(table, [(0, 0, 4, n_blk * bs, None, n_blk * bs, lk)])
 +    cap.capture(q, kv, 2, 0.3, cos_sin, rot)
 +    want_full = QCFuseImportanceCapturer._mass(q.view(4, 2, 2, hd).mean(2), k_rot, 0.3)
 +    assert torch.allclose(cap.buffer[0], want_full, atol=1e-5)
 +    # query rows inside the last span block never score keys after themselves
-+    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span, 8 * bs + 2)])
++    cap.begin_step(table, [(0, 0, 4, n_blk * bs, span, 8 * bs + 2, None)])
 +    cap.capture(q, kv, 2, 0.3)
 +    assert cap.buffer[0][8 * bs + 6 :].eq(0).all()
 +    assert cap.buffer[0][8 * bs + 2 : 8 * bs + 6].gt(0).all()
@@ -829,8 +827,9 @@ index 0000000000..1c21387cd4
 +    got = [(g.gap_start, g.gap_start + nsched[g.req_id]) for g in out]
 +    assert (64, 80) in got and (112, 128) in got
 +
-+    # (3) adjacent MISS blocks ride the probe as ONE virtual request, not one per block
-+    req.prefix_hit_sources = [D] * 4 + [PrefixHitSource.MISS] * 3 + [S] * 3
++    # (3) a span with MISS blocks was never warmed: recomputed whole, never probed
++    M = PrefixHitSource.MISS
++    req.prefix_hit_sources = [D] * 4 + [M] * 3 + [S] * 3
 +    req.spanfuse_state = req.span_gaps_selection = None
 +    req.pending_span_gaps = []
 +    queue.add_request(req)
@@ -838,17 +837,31 @@ index 0000000000..1c21387cd4
 +    ids.clear()
 +    nsched.clear()
 +    call()
-+    assert [r.req_id for r in out] == ["gap_test.64", "gap_test.probe"]
-+    assert nsched == {"gap_test.64": 48, "gap_test.probe": 64}
-+    # (4) the MISS blocks read the blind spans: the repair step recomputes them
++    assert req.spanfuse_state == "done" and req.spanfuse_settled == {64}
++    assert [(g.gap_start, g.gap_start + nsched[g.req_id]) for g in out] == [(64, 160)]
++
++    # (4) MISS blocks outside a warmed span ride the probe as ONE virtual
++    # request, and the repair step recomputes them again
++    req0, req = req, make_span_request(176, span_starts=[80])
++    req.prefix_hit_sources = [D] + [M] * 3 + [D] + [S] * 5
++    req.status = None
++    queue.add_request(req)
++    out.clear()
++    ids.clear()
++    nsched.clear()
++    call()
++    assert [r.req_id for r in out] == ["gap_test.16", "gap_test.probe"]
++    assert nsched == {"gap_test.16": 48, "gap_test.probe": 64}
 +    req.qcfuse_importance, req.spanfuse_state = imp, "measured"
 +    queue.add_request(req)
 +    out.clear()
 +    ids.clear()
 +    nsched.clear()
 +    call()
-+    assert [(g.gap_start, g.gap_start + nsched[g.req_id]) for g in out] == [(64, 128)]
++    got = [(g.gap_start, g.gap_start + nsched[g.req_id]) for g in out]
++    assert (16, 64) in got and (80, 96) in got
 +    assert req.spanfuse_miss_gaps == []
++    req = req0
 +
 +    # (5) an appended instruction replaces the cached window as the query rows
 +    monkeypatch.setattr(qcfuse, "_SPANFUSE_QUERY_IDS", [7] * 12)
@@ -862,8 +875,342 @@ index 0000000000..1c21387cd4
 +    p = out[0]
 +    assert nsched == {"gap_test.probe": 16 + 12} and p.spanfuse_window == 0
 +    assert p.spanfuse_query_rows == 12 and p.prompt_token_ids[-12:] == [7] * 12
++
++
++def test_spanfuse_per_span_probe_reads_each_spliced_sentence(monkeypatch):
++    """With mw query starts, each re-read span gets its own probe row: the
++    sentence spliced at that span's tail scores only that span's blocks."""
++    from types import SimpleNamespace
++    from unittest.mock import MagicMock
++
++    from vllm.v1.attention import qcfuse
++    from vllm.v1.core.sched.gap_policy import SpanFusePolicy, schedule_span_gaps
++    from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
++
++    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
++    monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
++    monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_QUERY_TOKEN_IDS", "7,8,9,10")
++    D, S = PrefixHitSource.PD, PrefixHitSource.PIC
++    blocks = MagicMock()
++    blocks.get_block_ids.return_value = (list(range(13)),)
++
++    def run(starts, rows=8, bad=False, stripped=False, settled=False):
++        req = make_span_request(176, span_starts=[32, 96])
++        req.spanfuse_query_stripped = stripped
++        req.prompt_token_ids[64:68] = [7, 8, 9, 10]
++        req.prompt_token_ids[128:132] = [7, 8, 9, 99] if bad else [7, 8, 9, 10]
++        req.spanfuse_query_starts = starts
++        req.prefix_hit_sources = [D] * (3 if settled else 2) + [S] * (7 if settled else 8)
++        req.status = None
++        sched = SimpleNamespace(
++            gap_policy=SpanFusePolicy(k_per_span=32),
++            block_size=16,
++            max_num_scheduled_tokens=8192,
++            max_model_len=4096,
++            max_num_running_reqs=rows,
++            running=[],
++            vllm_config=SimpleNamespace(model_config=None),
++            connector=None,
++            _merge_gaps=Scheduler._merge_gaps,
++            kv_cache_manager=SimpleNamespace(
++                allocate_slots=MagicMock(return_value=blocks),
++                get_blocks=MagicMock(return_value=blocks),
++            ),
++        )
++        queue = create_request_queue(SchedulingPolicy.FCFS)
++        queue.add_request(req)
++        out, nsched = [], {}
++        schedule_span_gaps(
++            sched, req, True, 160, 0, 160, MagicMock(), 8192, nsched, out, set(),
++            queue, create_request_queue(SchedulingPolicy.FCFS),
++        )
++        return req, out, nsched
++
++    req, out, nsched = run([64, 128])
++    got = [(p.req_id, p.num_computed_tokens, p.spanfuse_span_blocks) for p in out]
++    assert got == [("gap_test.probe0", 64, [2, 3]), ("gap_test.probe1", 128, [6, 7])]
++    assert all(p.spanfuse_window == p.spanfuse_query_rows == 4 for p in out)
++    assert nsched == {"gap_test.probe0": 4, "gap_test.probe1": 4}
++    assert req.spanfuse_state == "inflight"
++    # a sentence whose ids differ is not a probe
++    _, out, _ = run([64, 128], bad=True)
++    assert [p.num_computed_tokens for p in out] == [64]
++    # one free batch row: the newest span keeps it
++    _, out, _ = run([64, 128], rows=1)
++    assert [(p.req_id, p.num_computed_tokens) for p in out] == [("gap_test.probe0", 128)]
++    # stripped: the sentence is not in the prompt; each probe writes it to scratch
++    req, out, _ = run([64, 128, 136], stripped=True)
++    assert [p.block_ids for p in out] == [(list(range(4)) + [11],), (list(range(8)) + [12],)]
++    assert [p.prompt_token_ids[-4:] for p in out] == [[7, 8, 9, 10]] * 2
++    assert [p.spanfuse_probe_lb for p in out] == [32, 96]
++    assert all(p.spanfuse_window == 0 for p in out)
++    # span 0 hit its pd repair from an earlier turn: reused as cached, never re-probed
++    req, out, _ = run([64, 128], settled=True)
++    assert req.spanfuse_settled == {32}
++    assert [p.spanfuse_span_blocks for p in out] == [[6, 7]]
++    gaps = SpanFusePolicy(k_per_span=32)._select(req, [1.0] * 160, 160)
++    assert gaps and all(s >= 96 for s, _ in gaps)
++    # no mw starts: the single tail probe
++    monkeypatch.setattr(qcfuse, "_SPANFUSE_QUERY_IDS", [])
++    _, out, _ = run(None)
++    assert [p.req_id for p in out] == ["gap_test.probe"]
++
++
++def test_spanfuse_pad_rows_do_not_score(monkeypatch):
++    """A block of pads with high probe mass loses to a content block."""
++    from vllm.v1.core.sched.gap_policy import SpanFusePolicy
++
++    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
++    monkeypatch.setattr(envs, "VLLM_V1_SPANS_PAD_TOKEN", 27)
++    monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
++    req = make_span_request(96, span_starts=[16])
++    req.prompt_token_ids[64:80] = [27] * 16
++    imp = [0.0] * 96
++    imp[64:80] = [1.0] * 16
++    imp[40] = 0.5
++    pol = SpanFusePolicy(k_per_span=32)
++    assert pol._select(req, imp, 96) == [(16, 32), (32, 48)]
++    monkeypatch.setattr(envs, "VLLM_V1_SPANS_PAD_TOKEN", -1)
++    assert pol._select(req, imp, 96) == [(16, 32), (64, 80)]
++
++
++def test_spanfuse_anchor_blocks_env(monkeypatch):
++    """ANCHOR_BLOCKS=2 repairs span blocks 0-1, the probe ranks only the rest."""
++    from vllm.v1.core.sched.gap_policy import SpanFusePolicy
++
++    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
++    monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
++    req = make_span_request(128, span_starts=[16])
++    imp = [0.0] * 128
++    imp[96:112] = [1.0] * 16
++    imp[80] = 0.5
++    monkeypatch.setattr(envs, "VLLM_V1_SPANS_SPANFUSE_ANCHOR_BLOCKS", 2)
++    assert SpanFusePolicy(k_per_span=48)._select(req, imp, 128) == [
++        (16, 32), (32, 48), (96, 112)
++    ]
++    monkeypatch.setattr(envs, "VLLM_V1_SPANS_SPANFUSE_ANCHOR_BLOCKS", 1)
++    assert SpanFusePolicy(k_per_span=48)._select(req, imp, 128) == [
++        (16, 32), (80, 96), (96, 112)
++    ]
++
++
++def test_spanfuse_per_request_rho(monkeypatch):
++    """spans_repair_rho repairs that share of every span, overriding k_per_span; 0 repairs nothing."""
++    from vllm.v1.core.sched.gap_policy import SpanFusePolicy
++
++    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
++    monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
++    req = make_span_request(144, span_starts=[16])
++    imp = [0.0] * 144
++    imp[96:112] = [1.0] * 16
++    imp[64] = 0.5
++    pol = SpanFusePolicy(k_per_span=16)
++    assert pol._select(req, imp, 144) == [(16, 32)]
++    req.spanfuse_rho = 0.25  # 128 span tokens -> 32 -> head + best block
++    assert pol._select(req, imp, 144) == [(16, 32), (96, 112)]
++    req.spanfuse_rho = 0.0
++    assert pol._select(req, imp, 144) == []
++
++
++def test_spanfuse_request_share_on_every_path(monkeypatch):
++    """The request's share sets the token-granularity budget too; xargs outside [0, 1]
++    are ignored and spans_seed is parsed as a flag, not by truthiness."""
++    from vllm.v1.core.sched.gap_policy import SpanFusePolicy
++    from vllm.v1.request import _parse_rho
++
++    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
++    monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
++    req = make_span_request(144, span_starts=[16])
++    req.spanfuse_rho = 0.0
++    assert SpanFusePolicy(rho=0.15, granularity="token")._select(req, [0.0] * 144, 144) == []
++    assert SpanFusePolicy(k_per_span=512)._budget(req, 16, 144) == 0
++    assert SpanFusePolicy(k_per_span=0, rho=0.0)._budget(make_span_request(144, span_starts=[16]), 16, 144) == 0
++    vals = [None, "0.15", 2, -1, float("nan"), [1], "x"]
++    assert [_parse_rho(v) for v in vals] == [None, 0.15, None, None, None, None, None]
++    for flag, want in (("false", False), ("0", False), ("True", True), (True, True)):
++        sp = SamplingParams(max_tokens=1, extra_args={"span_starts": [16], "spans_seed": flag})
++        sp.update_from_generation_config({}, eos_token_id=100)
++        r = Request(request_id="s", prompt_token_ids=list(range(64)), sampling_params=sp, pooling_params=None)
++        assert r.spanfuse_seed is want, flag
++
++
++def test_spanfuse_otf_warm_then_probe(monkeypatch):
++    """A cold tail span is encoded span-locally and cached under its plain key,
++    then the re-lookup sees it as a PIC hit and the probe repairs it."""
++    from types import SimpleNamespace
++    from unittest.mock import MagicMock
++
++    from vllm.v1.attention import qcfuse
++    from vllm.v1.core.sched.gap_policy import SpanFusePolicy, schedule_span_gaps
++    from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
++
++    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
++    monkeypatch.setattr(qcfuse, "_SPANFUSE_QUERY_IDS", [])
++    monkeypatch.setattr(envs, "VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS", "0")
++    bs = 16
++    req = make_span_request(176, span_starts=[64], cross_span_starts=[128])
++    req.status = None
++    req.block_hashes = [f"h{i}" for i in range(11)]
++    blocks = MagicMock()
++    blocks.get_block_ids.return_value = ([0] * 11,)
++    pool = MagicMock()
++    sched = SimpleNamespace(
++        gap_policy=SpanFusePolicy(k_per_span=32),
++        block_size=bs,
++        max_num_scheduled_tokens=8192,
++        max_model_len=4096,
++        vllm_config=SimpleNamespace(model_config=None),
++        connector=None,
++        _merge_gaps=Scheduler._merge_gaps,
++        kv_cache_manager=SimpleNamespace(
++            allocate_slots=MagicMock(return_value=blocks),
++            get_blocks=MagicMock(return_value=blocks),
++            block_pool=pool,
++            coordinator=SimpleNamespace(
++                single_type_managers=[
++                    SimpleNamespace(req_to_blocks={"gap_test": [f"b{i}" for i in range(11)]})
++                ]
++            ),
++        ),
++    )
++    queue = create_request_queue(SchedulingPolicy.FCFS)
++    skipped = create_request_queue(SchedulingPolicy.FCFS)
++    out: list = []
++    nsched: dict[str, int] = {}
++    call = lambda n: schedule_span_gaps(
++        sched, req, True, n, 0, n, MagicMock(), 8192, nsched, out, set(), queue, skipped
++    )
++
++    # only the head is cached: the span is warmed span-locally, never probed
++    queue.add_request(req)
++    assert call(64) == 8192 - 64
++    assert [(r.req_id, r.is_gap_recompute) for r in out] == [("gap_test.64", False)]
++    assert nsched == {"gap_test.64": 64} and req.spanfuse_state == "otf"
++    pool.cache_blocks_under_hashes.assert_called_once_with(
++        ["b4", "b5", "b6", "b7"], ["h4", "h5", "h6", "h7"], 0
++    )
++
++    # the re-lookup returns the warmed span as PIC: the probe runs, then repair
++    D, S = PrefixHitSource.PD, PrefixHitSource.PIC
++    # a zero repair share skips the probe: its scores would select nothing
++    req.spanfuse_rho, req.spanfuse_state, req.prefix_hit_sources = 0.0, None, [D] * 4 + [S] * 4
++    queue.add_request(req)
++    out.clear()
++    nsched.clear()
++    call(128)
++    assert out == [] and req.qcfuse_importance == [0.0] * 128
++    # so does a share that covers the whole span
++    req.spanfuse_rho, req.spanfuse_state = 1.0, None
++    queue.add_request(req)
++    out.clear()
++    call(128)
++    assert out == []
++    # a partial share is scored even when the server k covers the span
++    sched.gap_policy.k_per_span = 64
++    req.spanfuse_rho, req.spanfuse_state, req.span_gaps_selection = 0.5, None, None
++    queue.add_request(req)
++    out.clear()
++    nsched.clear()
++    call(128)
++    assert [r.req_id for r in out] == ["gap_test.probe"]
++    sched.gap_policy.k_per_span, req.spanfuse_rho = 32, None
++    assert out[0].spanfuse_span_blocks == [4, 5, 6, 7]
++    imp = [0.0] * 128
++    imp[100] = 1.0
++    req.qcfuse_importance, req.spanfuse_state = imp, "measured"
++    queue.add_request(req)
++    out.clear()
++    nsched.clear()
++    call(128)
++    assert req.spanfuse_state == "done"
++    got = [(g.gap_start, g.gap_start + nsched[g.req_id]) for g in out]
++    assert (64, 80) in got and (96, 112) in got and pool.cache_blocks_under_hashes.call_count == 1
++
++
++def test_spanfuse_seed_encodes_in_context_under_plain_key(monkeypatch):
++    """With seed on, a cold tail span is encoded in its own context and cached
++    under the plain key that other contexts look up; this request never repairs it."""
++    from types import SimpleNamespace
++    from unittest.mock import MagicMock
++
++    from vllm.v1.attention import qcfuse
++    from vllm.v1.core.sched.gap_policy import SpanFusePolicy, schedule_span_gaps
++    from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
++
++    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
++    monkeypatch.setattr(qcfuse, "_SPANFUSE_QUERY_IDS", [])
++    req = make_span_request(176, span_starts=[64], cross_span_starts=[128])
++    req.status = None
++    req.spanfuse_seed = True
++    req.block_hashes = [f"h{i}" for i in range(11)]
++    req.pd_block_hashes = [f"p{i}" for i in range(11)]
++    D, S = PrefixHitSource.PD, PrefixHitSource.PIC
++    req.prefix_hit_sources = [S] * 4  # the prefix itself may be unrepaired PIC
++    blocks = MagicMock()
++    blocks.get_block_ids.return_value = ([0] * 11,)
++    pool = MagicMock()
++    sched = SimpleNamespace(
++        gap_policy=SpanFusePolicy(k_per_span=0, rho=0.25),
++        block_size=16,
++        max_num_scheduled_tokens=8192,
++        max_model_len=4096,
++        vllm_config=SimpleNamespace(model_config=None),
++        connector=None,
++        _merge_gaps=Scheduler._merge_gaps,
++        kv_cache_manager=SimpleNamespace(
++            allocate_slots=MagicMock(return_value=blocks),
++            get_blocks=MagicMock(return_value=blocks),
++            block_pool=pool,
++            coordinator=SimpleNamespace(
++                single_type_managers=[
++                    SimpleNamespace(req_to_blocks={"gap_test": [f"b{i}" for i in range(11)]})
++                ]
++            ),
++        ),
++    )
++    queue = create_request_queue(SchedulingPolicy.FCFS)
++    skipped = create_request_queue(SchedulingPolicy.FCFS)
++    out: list = []
++    nsched: dict[str, int] = {}
++    call = lambda n: schedule_span_gaps(
++        sched, req, True, n, 0, n, MagicMock(), 8192, nsched, out, set(), queue, skipped
++    )
++
++    queue.add_request(req)
++    assert call(64) == 8192 - 64
++    assert [(r.req_id, r.is_gap_recompute) for r in out] == [("gap_test.64", True)]
++    pool.cache_blocks_under_hashes.assert_called_once_with(
++        ["b4", "b5", "b6", "b7"], ["h4", "h5", "h6", "h7"], 0
++    )
++    assert req.spanfuse_seeded == {64} and req.spanfuse_state == "otf"
++
++    # the re-lookup sees the seed as PIC, but it is this request's own copy: no probe
++    req.spanfuse_state, req.prefix_hit_sources = None, [D] * 4 + [S] * 4
++    queue.add_request(req)
++    out.clear()
++    call(128)
++    assert 64 in req.spanfuse_settled and out == []
++
++
++    # not settled: a seed that read an unrepaired earlier span, or a span whose block
++    # hash another span in this tail shares (the lookup resolves it to the first copy)
++    for starts, crosses, hashes in (
++        ([16, 64], [48, 128], [f"h{i}" for i in range(11)]),
++        ([64, 96], [128], ["h0", "h1", "h2", "h3", "x", "h5", "x", "h7", "h8", "h9", "h10"]),
++    ):
++        req2 = make_span_request(176, span_starts=starts, cross_span_starts=crosses)
++        req2.status, req2.spanfuse_seed, req2.block_hashes = None, True, hashes
++        req2.pd_block_hashes = [f"p{i}" for i in range(11)]
++        req2.prefix_hit_sources = [S] * 4
++        queue.add_request(req2)
++        out.clear()
++        schedule_span_gaps(
++            sched, req2, True, 64, 0, 64, MagicMock(), 8192, nsched, out, set(), queue, skipped
++        )
++        assert req2.spanfuse_state == "otf" and req2.spanfuse_seeded == set(), starts
++        assert pool.cache_blocks_under_hashes.call_args[0][1] == hashes[4:8], starts
 diff --git a/tests/v1/core/test_kv_cache_utils.py b/tests/v1/core/test_kv_cache_utils.py
-index 3be24d7fb3..fb471f7075 100644
+index 3be24d7fb3..9160720bac 100644
 --- a/tests/v1/core/test_kv_cache_utils.py
 +++ b/tests/v1/core/test_kv_cache_utils.py
 @@ -665,6 +665,82 @@ def test_hash_block_tokens(hash_fn):
@@ -1139,6 +1486,136 @@ index 3be24d7fb3..fb471f7075 100644
  def test_hma_not_disabled_when_kv_events_enabled():
      """
      Test enabling KV events must not force disable_hybrid_kv_cache_manager to True.
+@@ -2414,3 +2673,36 @@ def test_hma_not_disabled_when_kv_events_enabled():
+     assert vllm_config.scheduler_config.disable_hybrid_kv_cache_manager is False, (
+         "kv_events_config must not force-disable the hybrid KV cache manager."
+     )
++
++
++@pytest.mark.spans
++def test_span_blocks_never_share_hash_with_rotated_blocks(monkeypatch):
++    """Span K is cached at p - span_start: a span block matches the same tokens
++    prefilled bare (the warm-up copy), but its pd copy, chained from position 0,
++    never matches a pd copy whose K is at p."""
++    import vllm.envs as envs
++
++    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
++    bs = 16
++
++    def req(extra_args, toks=range(4 * bs)):
++        sp = SamplingParams(max_tokens=17, extra_args=extra_args)
++        sp.update_from_generation_config({}, eos_token_id=100)
++        return Request(
++            request_id="r",
++            prompt_token_ids=list(toks),
++            sampling_params=sp,
++            pooling_params=None,
++            block_hasher=get_request_block_hasher(bs, sha256),
++        )
++
++    plain = req(None).block_hashes
++    # a span at 0 is K at p, the same KV as a spans-off prompt
++    assert req({"span_starts": [0], "cross_span_starts": [2 * bs]}).block_hashes[:2] == plain[:2]
++    span1 = req({"span_starts": [bs], "cross_span_starts": [2 * bs]})
++    assert span1.block_hashes[0] == plain[0]
++    assert span1.block_hashes[1] == req(None, range(bs, 2 * bs)).block_hashes[0]
++    # same tokens and pd chain, K at p - bs (span) vs K at p (head)
++    head = req({"span_starts": [2 * bs], "cross_span_starts": [3 * bs]})
++    assert span1.pd_block_hashes[0] == head.pd_block_hashes[0]
++    assert span1.pd_block_hashes[1] != head.pd_block_hashes[1]
+diff --git a/tests/v1/core/test_prefix_caching.py b/tests/v1/core/test_prefix_caching.py
+index b0be55bb49..e69761da61 100644
+--- a/tests/v1/core/test_prefix_caching.py
++++ b/tests/v1/core/test_prefix_caching.py
+@@ -3903,3 +3903,88 @@ def test_pure_swa_retention_dense_default_caches_all(monkeypatch):
+         is not None
+     }
+     assert cached == set(range(16))
++
++
++@pytest.mark.spans
++@pytest.mark.parametrize("seed", [False, True])
++def test_seed_drops_a_span_that_hits_only_its_header(monkeypatch, seed):
++    """Two files read through the same tool share the span's first block. Without
++    seed the lookup stops inside the new span; with seed the whole span is cold,
++    so the otf encode sees it from its start."""
++    import vllm.envs as envs
++
++    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
++    bs = 16
++    manager = make_kv_cache_manager(
++        make_kv_cache_config(bs, 32), max_model_len=8192, hash_block_size=bs
++    )
++
++    def req(rid, body):
++        sp = SamplingParams(max_tokens=17, extra_args={"span_starts": [bs]})
++        sp.update_from_generation_config({}, eos_token_id=100)
++        r = Request(
++            request_id=rid,
++            prompt_token_ids=list(range(2 * bs)) + body + [7],
++            sampling_params=sp,
++            pooling_params=None,
++            block_hasher=get_request_block_hasher(bs, sha256),
++        )
++        r.spanfuse_seed = seed
++        return r
++
++    first = req("first", list(range(1000, 1000 + 3 * bs)))
++    blocks, n = manager.get_computed_blocks(first)
++    manager.allocate_slots(first, first.num_tokens - n, n, blocks)
++    manager.free(first)
++
++    other = req("other", list(range(2000, 2000 + 3 * bs)))
++    _, n = manager.get_computed_blocks(other)
++    assert n == (bs if seed else 2 * bs)
++
++
++@pytest.mark.spans
++def test_spanfuse_probe_miss_copies_stay_private(monkeypatch):
++    """A delayed probe swaps its MISS blocks to fresh hash-less copies that the
++    repair step rewrites in place, so no other prefix may ever hit them."""
++    import vllm.envs as envs
++    from vllm.v1.core.kv_cache_utils import PrefixHitSource
++
++    monkeypatch.setattr(envs, "VLLM_V1_SPANS_ENABLED", True)
++    bs = 16
++    manager = make_kv_cache_manager(
++        make_kv_cache_config(bs, 32), max_model_len=8192, hash_block_size=bs
++    )
++
++    def req(rid):
++        sp = SamplingParams(max_tokens=17, extra_args={"span_starts": [bs]})
++        sp.update_from_generation_config({}, eos_token_id=100)
++        return Request(
++            request_id=rid,
++            prompt_token_ids=list(range(4 * bs + 1)),
++            sampling_params=sp,
++            pooling_params=None,
++            block_hasher=get_request_block_hasher(bs, sha256),
++        )
++
++    warm = req("warm")
++    blocks, n = manager.get_computed_blocks(warm)
++    manager.allocate_slots(warm, warm.num_tokens - n, n, blocks)
++    manager.free(warm)
++
++    probe = req("probe")
++    blocks, n = manager.get_computed_blocks(probe)
++    assert n == 4 * bs
++    probe.prefix_hit_sources[1] = PrefixHitSource.MISS
++    gap = [(bs, 2 * bs)]
++    manager.allocate_slots(
++        probe, 1, n, blocks, delay_cache_blocks=True, span_gaps=gap
++    )
++    copy_ = manager.coordinator.single_type_managers[0].req_to_blocks["probe"][1]
++    assert copy_.block_hash is None and copy_.ref_cnt == 1
++
++    probe.prefix_hit_sources[1] = PrefixHitSource.PD  # what the probe launch sets
++    probe.num_computed_tokens = n
++    manager.allocate_slots(probe, 1, span_gaps=gap)
++    req_blocks = manager.coordinator.single_type_managers[0].req_to_blocks["probe"]
++    assert req_blocks[1] is copy_ and copy_.block_hash is None
++    assert manager.block_pool.get_cached_block(probe.pd_block_hashes[1], [0]) is None
 diff --git a/tests/v1/determinism/test_router_gemm_batch_invariant.py b/tests/v1/determinism/test_router_gemm_batch_invariant.py
 new file mode 100644
 index 0000000000..25d1538200
@@ -1561,10 +2038,10 @@ index 0000000000..2abfe1caca
 +    return req.block_hashes
 diff --git a/tests/v1/e2e/spans/test_legolink_gap_policy.py b/tests/v1/e2e/spans/test_legolink_gap_policy.py
 new file mode 100644
-index 0000000000..5af27b7318
+index 0000000000..ceb67b9ca8
 --- /dev/null
 +++ b/tests/v1/e2e/spans/test_legolink_gap_policy.py
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,197 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +import threading
@@ -1762,44 +2239,6 @@ index 0000000000..5af27b7318
 +        )
 +    finally:
 +        cleanup(llm)
-+
-+
-+def test_spans_prerotate_matches_per_tile_e2e(model, monkeypatch):
-+    """Prerotate must be a pure optimization: the block-wise K-prerotate scratch
-+    (VLLM_V1_SPANS_PREROTATE=1) must give byte-identical step-0 top-K to the
-+    per-tile in-kernel rotation (=0) on the same marked LL run - which mixes a
-+    pure-span gap recompute (prerotate fires) with a cross-tail prefill (per-tile
-+    fallback). Guards against the scratch diverging from per-tile in future edits.
-+    """
-+    import vllm.envs as envs
-+
-+    _force_in_process_engine(monkeypatch)
-+    prefix = list(range(0, BLOCK_SIZE * 2))
-+    span = list(range(500, 500 + BLOCK_SIZE * 2))
-+    cross_tail = list(range(900, 900 + BLOCK_SIZE * 2))
-+    prompt = prefix + span + cross_tail
-+    extra = {"span_starts": [BLOCK_SIZE * 2], "cross_span_starts": [BLOCK_SIZE * 4]}
-+
-+    tops = {}
-+    for prerotate in (True, False):
-+        monkeypatch.setenv("VLLM_V1_SPANS_PREROTATE", "1" if prerotate else "0")
-+        monkeypatch.setattr(envs, "VLLM_V1_SPANS_PREROTATE", prerotate)
-+        llm = build_llm(model, "LL-32", monkeypatch)
-+        try:
-+            _warmup_prompt(llm, span)
-+            _warmup_prompt(llm, prefix)
-+            out = generate_single_output(
-+                llm, prompt, greedy_sp(extra_args=extra, logprobs=LOGPROBS_TOPK)
-+            )
-+            tops[prerotate] = extract_step0_topk(out.outputs[0], LOGPROBS_TOPK)
-+        finally:
-+            cleanup(llm)
-+
-+    assert tops[True], "no step-0 logprobs captured"
-+    assert tops[True] == tops[False], (
-+        "prerotate scratch diverged from per-tile rotation:\n"
-+        f"  prerotate on : {tops[True]}\n  prerotate off: {tops[False]}"
-+    )
 diff --git a/tests/v1/e2e/spans/test_spans_determinism.py b/tests/v1/e2e/spans/test_spans_determinism.py
 new file mode 100644
 index 0000000000..715f719d39
@@ -2348,10 +2787,10 @@ index 0000000000..318cd4e67f
 +        cleanup(llm)
 diff --git a/tests/v1/worker/test_span_lb_pairing.py b/tests/v1/worker/test_span_lb_pairing.py
 new file mode 100644
-index 0000000000..e88ccb9dd7
+index 0000000000..6d484d505a
 --- /dev/null
 +++ b/tests/v1/worker/test_span_lb_pairing.py
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,70 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""SPANS: cross_span_starts/span_starts pairing (pure, no engine).
@@ -2408,6 +2847,20 @@ index 0000000000..e88ccb9dd7
 +    # The range rule mirrors compute_span_lb_regions with None for "open":
 +    regions = compute_span_lb_regions([B, 3 * B], [5 * B], 10 * B)
 +    assert regions[0][1] == 3 * B and regions[1][1] == 5 * B
++
++
++def test_regions_clipped_to_req_len():
++    # non-final prefill chunk / probe / virtual request: req_len < prompt.
++    # Nothing may reach past req_len, or it lands in the next request's slice.
++    regions = compute_span_lb_regions([B, 4 * B, 8 * B], [6 * B, 10 * B], 5 * B)
++    assert regions == [(B, 4 * B, B), (4 * B, 5 * B, 4 * B)]
++    assert compute_span_lb_regions([8 * B], [10 * B], 5 * B) == []
++
++
++def test_noclip_keeps_the_old_overflow():
++    # VLLM_V1_SPANS_LB_NOCLIP knock-in: same regions as before the clip
++    regions = compute_span_lb_regions([B, 4 * B, 8 * B], [6 * B, 10 * B], 5 * B, False)
++    assert regions == [(B, 4 * B, B), (4 * B, 6 * B, 4 * B), (8 * B, 5 * B, 8 * B)]
 diff --git a/vllm/config/scheduler.py b/vllm/config/scheduler.py
 index 95f3ed48d4..47deb1ee78 100644
 --- a/vllm/config/scheduler.py
@@ -2911,10 +3364,10 @@ index 1f7296cdaa..b2fc052d70 100644
          self,
          request: ChatCompletionRequest,
 diff --git a/vllm/envs.py b/vllm/envs.py
-index 10f8fef4a7..4639275895 100755
+index 10f8fef4a7..d313306e6d 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -258,6 +258,29 @@ if TYPE_CHECKING:
+@@ -258,6 +258,34 @@ if TYPE_CHECKING:
      VLLM_USE_V2_MODEL_RUNNER: bool | None = None
      VLLM_LOG_MODEL_INSPECTION: bool = False
      VLLM_DEBUG_MFU_METRICS: bool = False
@@ -2928,7 +3381,6 @@ index 10f8fef4a7..4639275895 100755
 +    VLLM_V1_SPANS_BLOCK_SIZE: int = 0
 +    VLLM_V1_SPANS_GAP_POLICY_ENABLE: bool = False
 +    VLLM_V1_SPANS_GAP_LENGTH: int = 32
-+    VLLM_V1_SPANS_PREROTATE: bool = True
 +    VLLM_V1_SPANS_QCFUSE_ENABLE: bool = False
 +    VLLM_V1_SPANS_QCFUSE_RHO: float = 0.1
 +    VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS: str = ""
@@ -2937,14 +3389,20 @@ index 10f8fef4a7..4639275895 100755
 +    VLLM_V1_SPANS_NEIGHBOR_AWARE_ENABLE: bool = False
 +    VLLM_V1_SPANS_SPANFUSE_ENABLE: bool = False
 +    VLLM_V1_SPANS_SPANFUSE_NORM_CHECK: bool = False
++    VLLM_V1_SPANS_SPANFUSE_ANCHOR_BLOCKS: int = 1
++    VLLM_V1_SPANS_SPANFUSE_SEED: bool = False
++    VLLM_V1_SPANS_SHIFT_DUMP: str = ""
++    VLLM_V1_SPANS_LB_NOCLIP: bool = False
++    VLLM_V1_SPANS_LB_SPILL_LOG: bool = False
 +    VLLM_V1_SPANS_SPANFUSE_QUERY: str = (
 +        "Based on this tool output, continue with the task."
 +    )
++    VLLM_V1_SPANS_QCFUSE_QUERY_TOKEN_IDS: str = ""
 +
      VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
      VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
      VLLM_WSL2_ENABLE_PIN_MEMORY: bool = False
-@@ -1689,6 +1712,78 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -1689,6 +1717,96 @@ environment_variables: dict[str, Callable[[], Any]] = {
      "VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS": lambda: bool(
          int(os.getenv("VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS", "0"))
      ),
@@ -2977,10 +3435,6 @@ index 10f8fef4a7..4639275895 100755
 +    "VLLM_V1_SPANS_GAP_LENGTH": lambda: int(
 +        os.environ.get("VLLM_V1_SPANS_GAP_LENGTH", "32")
 +    ),
-+    # rotate K once per forward into a transient scratch (prefill batches)
-+    # instead of per-tile inside the attention kernel
-+    "VLLM_V1_SPANS_PREROTATE": lambda: os.environ.get("VLLM_V1_SPANS_PREROTATE", "True")
-+    == "True",
 +    # QCFuse: recompute a query-selected subset of cached tokens on all layers
 +    "VLLM_V1_SPANS_QCFUSE_ENABLE": lambda: os.environ.get(
 +        "VLLM_V1_SPANS_QCFUSE_ENABLE", "False"
@@ -3011,11 +3465,33 @@ index 10f8fef4a7..4639275895 100755
 +    "VLLM_V1_SPANS_SPANFUSE_NORM_CHECK": lambda: (
 +        os.environ.get("VLLM_V1_SPANS_SPANFUSE_NORM_CHECK", "False") == "True"
 +    ),
++    # SPANFUSE: leading blocks of every span always repaired before probe ranking
++    "VLLM_V1_SPANS_SPANFUSE_ANCHOR_BLOCKS": lambda: int(
++        os.environ.get("VLLM_V1_SPANS_SPANFUSE_ANCHOR_BLOCKS", "1")
++    ),
++    # SPANFUSE: a cold span is encoded in its first context and that copy is the shared one
++    "VLLM_V1_SPANS_SPANFUSE_SEED": lambda: (
++        os.environ.get("VLLM_V1_SPANS_SPANFUSE_SEED", "False") == "True"
++    ),
++    # SPANSHIFT: dump blind and repaired K/V of every gap-swapped block to this dir
++    "VLLM_V1_SPANS_SHIFT_DUMP": lambda: os.environ.get("VLLM_V1_SPANS_SHIFT_DUMP", ""),
++    # SPANS: diagnostic only - restore the unclipped lb regions that overflow
++    "VLLM_V1_SPANS_LB_NOCLIP": lambda: (
++        os.environ.get("VLLM_V1_SPANS_LB_NOCLIP", "False") == "True"
++    ),
++    # SPANS: log query rows whose lb word came from another request's regions
++    "VLLM_V1_SPANS_LB_SPILL_LOG": lambda: (
++        os.environ.get("VLLM_V1_SPANS_LB_SPILL_LOG", "False") == "True"
++    ),
 +    # SPANFUSE: instruction appended in the scoring pass; its rows are the query,
 +    # "" scores from the prompt's own last QCFUSE_MAX_QUERY_TOKENS tokens instead
 +    "VLLM_V1_SPANS_SPANFUSE_QUERY": lambda: os.environ.get(
 +        "VLLM_V1_SPANS_SPANFUSE_QUERY",
 +        "Based on this tool output, continue with the task.",
++    ),
++    # SPANFUSE: ids of the sentence the mw splices after every span (qcfuse_query_starts)
++    "VLLM_V1_SPANS_QCFUSE_QUERY_TOKEN_IDS": lambda: os.environ.get(
++        "VLLM_V1_SPANS_QCFUSE_QUERY_TOKEN_IDS", ""
 +    ),
 +    "VLLM_V1_SPANS_NEIGHBOR_AWARE_ENABLE": lambda: (
 +        os.environ.get("VLLM_V1_SPANS_NEIGHBOR_AWARE_ENABLE", "False") == "True"
@@ -3204,45 +3680,6 @@ index e2c938ddad..e62b268951 100644
              from .lamport_workspace import (
                  get_allreduce_workspace,
              )
-diff --git a/vllm/model_executor/layers/rotary_embedding/base.py b/vllm/model_executor/layers/rotary_embedding/base.py
-index 41291a9b56..f57c27cb6d 100644
---- a/vllm/model_executor/layers/rotary_embedding/base.py
-+++ b/vllm/model_executor/layers/rotary_embedding/base.py
-@@ -4,6 +4,7 @@
- 
- import torch
- 
-+import vllm.envs as envs
- from vllm._aiter_ops import rocm_aiter_ops
- from vllm.model_executor.custom_op import CustomOp
- 
-@@ -186,7 +187,7 @@ class RotaryEmbedding(RotaryEmbeddingBase):
-         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
- 
-         # key may be None in some cases, e.g. cross-layer KV sharing
--        if key is not None:
-+        if key is not None and not envs.VLLM_V1_SPANS_ENABLED:
-             key_shape = key.shape
-             key = key.view(num_tokens, -1, head_size)
-             key_rot = key[..., :rotary_dim]
-@@ -228,7 +229,7 @@ class RotaryEmbedding(RotaryEmbeddingBase):
-             torch.ops.vllm.flashinfer_rotary_embedding(
-                 positions,
-                 query,
--                key,
-+                None if envs.VLLM_V1_SPANS_ENABLED else key,
-                 self.head_size,
-                 self.cos_sin_cache,
-                 self.is_neox_style,
-@@ -244,7 +245,7 @@ class RotaryEmbedding(RotaryEmbeddingBase):
-         ops.rotary_embedding(
-             positions,
-             query,
--            key,
-+            None if envs.VLLM_V1_SPANS_ENABLED else key,
-             self.head_size,
-             cos_sin_cache,
-             self.is_neox_style,
 diff --git a/vllm/model_executor/models/gemma4.py b/vllm/model_executor/models/gemma4.py
 index 03e67c4ada..16ec6a3c9b 100644
 --- a/vllm/model_executor/models/gemma4.py
@@ -3261,7 +3698,7 @@ index 03e67c4ada..16ec6a3c9b 100644
      def forward(
          self,
 diff --git a/vllm/v1/attention/backend.py b/vllm/v1/attention/backend.py
-index 152178ec2b..eec26b0965 100644
+index 152178ec2b..21414089cd 100644
 --- a/vllm/v1/attention/backend.py
 +++ b/vllm/v1/attention/backend.py
 @@ -387,6 +387,13 @@ class CommonAttentionMetadata:
@@ -3273,57 +3710,16 @@ index 152178ec2b..eec26b0965 100644
 +
 +    attn_lower_bounds: torch.Tensor | None = None  # SPANS: per-KV-pos lower bound
 +    req_kv_starts: torch.Tensor | None = None  # SPANS: per-req start into attn_lb
-+    spans_prerotate_safe: bool = True
++    spans_no_raw_k: bool = False  # SPANS: no span token in the batch
 +
      causal: bool | torch.Tensor = True
  
      # Needed by FastPrefillAttentionBuilder
 diff --git a/vllm/v1/attention/backends/triton_attn.py b/vllm/v1/attention/backends/triton_attn.py
-index 714c63ae3c..81828e9ac7 100644
+index 714c63ae3c..2b9fcadeaa 100644
 --- a/vllm/v1/attention/backends/triton_attn.py
 +++ b/vllm/v1/attention/backends/triton_attn.py
-@@ -39,7 +39,10 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
-     triton_reshape_and_cache_flash,
-     triton_reshape_and_cache_flash_per_token_head_quant,
- )
--from vllm.v1.attention.ops.triton_unified_attention import unified_attention
-+from vllm.v1.attention.ops.triton_unified_attention import (
-+    rotate_k_prepass,
-+    unified_attention,
-+)
- from vllm.v1.kv_cache_interface import (
-     AttentionSpec,
-     KVQuantMode,
-@@ -52,9 +55,28 @@ logger = init_logger(__name__)
- 
- # constants
- MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
-+PREROTATE_MAX_SCRATCH_MB = 4096  # larger prefill batches keep the fused path
- NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
- 
- 
-+_K_SCRATCH: dict[tuple[torch.device, torch.dtype, int, int, int], torch.Tensor] = {}
-+
-+
-+def _get_k_scratch(key_cache: torch.Tensor, total_blocks: int) -> torch.Tensor:
-+    # transient per-forward K scratch: grown on demand, overwritten each prefill
-+    blk, heads, hdim = key_cache.shape[1], key_cache.shape[2], key_cache.shape[3]
-+    key = (key_cache.device, key_cache.dtype, blk, heads, hdim)
-+    buf = _K_SCRATCH.get(key)
-+    if buf is None or buf.shape[0] < total_blocks:
-+        buf = torch.empty(
-+            (total_blocks, blk, heads, hdim),
-+            dtype=key_cache.dtype,
-+            device=key_cache.device,
-+        )
-+        _K_SCRATCH[key] = buf
-+    return buf
-+
-+
- @dataclass
- class TritonAttentionMetadata:
-     # NOTE(sang): Definition of context_len, query_len, and seq_len.
-@@ -88,6 +110,14 @@ class TritonAttentionMetadata:
+@@ -88,6 +88,11 @@ class TritonAttentionMetadata:
      prefix_kv_lens: torch.Tensor | None
      suffix_kv_lens: torch.Tensor | None
  
@@ -3331,14 +3727,11 @@ index 714c63ae3c..81828e9ac7 100644
 +    rotary_dim: int = 0
 +    attn_lower_bounds: torch.Tensor | None = None
 +    req_kv_starts: torch.Tensor | None = None
-+    # SPANS prerotate: per-req block table into the K scratch
-+    k_scratch_block_table: torch.Tensor | None = None
-+    k_scratch_total_blocks: int = 0
 +
      # Optional aot scheduling
      scheduler_metadata: torch.Tensor | None = None
      prefix_scheduler_metadata: torch.Tensor | None = None
-@@ -213,6 +243,44 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
+@@ -213,6 +218,20 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
              suffix_kv_lens = None
              prefix_scheduler_metadata = None
  
@@ -3347,43 +3740,19 @@ index 714c63ae3c..81828e9ac7 100644
 +            rotary_dim = common_attn_metadata.rotary_dim
 +            attn_lower_bounds = common_attn_metadata.attn_lower_bounds
 +            req_kv_starts = common_attn_metadata.req_kv_starts
-+            # prefill-bearing batches only: attention runs eagerly there, so
-+            # the data-dependent scratch never enters a captured decode graph
-+            k_scratch_block_table = None
-+            k_scratch_total_blocks = 0
-+            if (
-+                envs.VLLM_V1_SPANS_PREROTATE
-+                and cos_sin_cache is not None
-+                and common_attn_metadata.spans_prerotate_safe
-+                and max_query_len > 1
-+            ):
-+                blk = self.block_size
-+                nblk = (seq_lens[:num_reqs] + (blk - 1)) // blk
-+                starts = torch.cumsum(nblk, 0) - nblk
-+                total = int(nblk.sum().item())
-+                # 2B/elt (bf16/fp16); fp8 rejected at use time
-+                scratch_mb = (total * blk * self.num_heads_kv * self.headdim * 2) // (
-+                    1024 * 1024
-+                )
-+                if total > 0 and scratch_mb <= PREROTATE_MAX_SCRATCH_MB:
-+                    width = block_table_tensor.shape[1]
-+                    ar = torch.arange(width, device=seq_lens.device, dtype=torch.int32)
-+                    k_scratch_block_table = (
-+                        starts.to(torch.int32)[:, None] + ar[None, :]
-+                    ).clamp_(max=max(total - 1, 0))
-+                    k_scratch_total_blocks = total
++            if max_query_len > 1 and common_attn_metadata.spans_no_raw_k:
++                # eager batch with no span token: all K rotated, run stock attention
++                cos_sin_cache = attn_lower_bounds = req_kv_starts = None
 +        else:
 +            cos_sin_cache = None
 +            rotary_dim = 0
 +            attn_lower_bounds = None
 +            req_kv_starts = None
-+            k_scratch_block_table = None
-+            k_scratch_total_blocks = 0
 +
          attn_metadata = TritonAttentionMetadata(
              num_actual_tokens=num_actual_tokens,
              max_query_len=max_query_len,
-@@ -233,6 +301,12 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
+@@ -233,6 +252,10 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
              softmax_segm_output=self.softmax_segm_output,
              softmax_segm_max=self.softmax_segm_max,
              softmax_segm_expsum=self.softmax_segm_expsum,
@@ -3391,12 +3760,10 @@ index 714c63ae3c..81828e9ac7 100644
 +            rotary_dim=rotary_dim,
 +            attn_lower_bounds=attn_lower_bounds,
 +            req_kv_starts=req_kv_starts,
-+            k_scratch_block_table=k_scratch_block_table,
-+            k_scratch_total_blocks=k_scratch_total_blocks,
          )
  
          mm_ranges = common_attn_metadata.mm_req_doc_ranges
-@@ -637,6 +711,47 @@ class TritonAttentionImpl(AttentionImpl):
+@@ -637,6 +660,19 @@ class TritonAttentionImpl(AttentionImpl):
          softmax_segm_max = attn_metadata.softmax_segm_max
          softmax_segm_expsum = attn_metadata.softmax_segm_expsum
  
@@ -3413,38 +3780,10 @@ index 714c63ae3c..81828e9ac7 100644
 +        attn_lower_bounds = attn_metadata.attn_lower_bounds
 +        req_kv_starts = attn_metadata.req_kv_starts
 +
-+        # SPANS prerotate: rotate K once into the scratch, run kernel with
-+        # fused RoPE off; quantized caches / TD keep the fused path
-+        k_scratch = None
-+        k_scratch_block_table = attn_metadata.k_scratch_block_table
-+        if (
-+            k_scratch_block_table is not None
-+            and cos_sin_cache is not None
-+            and self._kv_quant_mode == KVQuantMode.NONE
-+            and not self.use_td
-+        ):
-+            k_scratch = _get_k_scratch(key_cache, attn_metadata.k_scratch_total_blocks)
-+            rotate_k_prepass(
-+                key_cache,
-+                k_scratch,
-+                block_table,
-+                k_scratch_block_table,
-+                seqused_k,
-+                max_seqlen_k,
-+                cos_sin_cache,
-+                rotary_dim,
-+                attn_lower_bounds,
-+                req_kv_starts,
-+            )
-+            cos_sin_cache = None
-+            rotary_dim = 0
-+        else:
-+            k_scratch_block_table = None
-+
          mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
  
          unified_attention(
-@@ -665,12 +780,18 @@ class TritonAttentionImpl(AttentionImpl):
+@@ -665,12 +701,16 @@ class TritonAttentionImpl(AttentionImpl):
              softmax_segm_expsum=softmax_segm_expsum,
              sinks=self.sinks,
              output_scale=output_scale,
@@ -3458,8 +3797,6 @@ index 714c63ae3c..81828e9ac7 100644
              use_td=self.use_td,
 +            attn_lower_bounds=attn_lower_bounds,
 +            req_kv_starts=req_kv_starts,
-+            k_scratch=k_scratch,
-+            k_scratch_block_table=k_scratch_block_table,
          )
  
          return output
@@ -3498,228 +3835,73 @@ index 320b7aa597..642908b28b 100644
          kv_cache_dtype
      ):
 diff --git a/vllm/v1/attention/ops/triton_unified_attention.py b/vllm/v1/attention/ops/triton_unified_attention.py
-index f39e44286b..01215c15a3 100644
+index f39e44286b..ea4c00ff3c 100644
 --- a/vllm/v1/attention/ops/triton_unified_attention.py
 +++ b/vllm/v1/attention/ops/triton_unified_attention.py
-@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import KVQuantMode
+@@ -33,6 +33,13 @@ from vllm.v1.kv_cache_interface import KVQuantMode
  logger = init_logger(__name__)
  is_batch_invariant = envs.VLLM_BATCH_INVARIANT
  float8_info = torch.finfo(current_platform.fp8_dtype())
 +INT32_MAX = tl.constexpr(torch.iinfo(torch.int32).max)
++# SPANS lb word (packed by gpu_model_runner): low bits = L, K and Q at RoPE p - L
++SPANS_FULLQ = 1 << 29  # query row reads the whole prefix (gap recompute, probe)
++SPANS_LB_MASK = SPANS_FULLQ - 1
++_SPANS_FULLQ = tl.constexpr(SPANS_FULLQ)
++_SPANS_LB_MASK = tl.constexpr(SPANS_LB_MASK)
++SPANS_SCAN = tl.constexpr(1024)  # lb words read per run-end scan step
  
  
  @triton.jit
-@@ -175,6 +176,202 @@ def _store_output_td(
+@@ -175,6 +182,42 @@ def _store_output_td(
      )
  
  
 +@triton.jit
-+def _load_rotate_k(
-+    key_cache_ptr,
-+    k_base,  # [KEYS] per-key base offset (block + head + slot strides applied)
-+    rel_pos,  # [KEYS] span-relative position indexing the cos/sin cache
-+    key_mask,  # [KEYS] valid-key mask
-+    offs_d,  # [HEAD_SIZE_PADDED]
-+    k_scale,
++def _load_rotate_q(
++    q_rows,  # [BLOCK_M, 1] pointers to each query row
++    row_mask,  # [BLOCK_M, 1]
++    shift,  # [BLOCK_M] per-row RoPE shift, may be negative
++    offs_d,
 +    cos_sin_cache_ptr,
-+    stride_k_cache_3: tl.constexpr,
 +    stride_cs_cache_0: tl.int64,
 +    stride_cs_cache_1: tl.constexpr,
 +    HEAD_SIZE: tl.constexpr,
-+    ROTARY_DIM: tl.constexpr,  # 0 means rotary_dim == head_size
++    ROTARY_DIM: tl.constexpr,
 +):
-+    """Load un-rotated K, apply span-relative neox RoPE in fp32; caller rounds
-+    once (FR-parity, csrc/libtorch_stable/pos_encoding_kernels.cu). Shared by
-+    the fused path and kernel_rotate_k_prepass. Returns fp32 (D_PAD, KEYS)."""
++    """SPANS: R(shift) Q in fp32, reloaded from memory; shift 0 is the identity."""
 +    ROT: tl.constexpr = (
 +        HEAD_SIZE if (ROTARY_DIM <= 0 or ROTARY_DIM > HEAD_SIZE) else ROTARY_DIM
 +    )
 +    HALF_ROT: tl.constexpr = ROT // 2
-+    dim_mask = offs_d < HEAD_SIZE
 +    x_part = offs_d < HALF_ROT
-+    partner_d = tl.where(x_part, offs_d + HALF_ROT, offs_d - HALF_ROT)
-+    K_raw = tl.load(
-+        key_cache_ptr + k_base[None, :] + offs_d[:, None] * stride_k_cache_3,
-+        mask=dim_mask[:, None] & key_mask[None, :],
-+        other=0.0,
-+    )
-+    K_partner = tl.load(
-+        key_cache_ptr + k_base[None, :] + partner_d[:, None] * stride_k_cache_3,
-+        mask=dim_mask[:, None] & key_mask[None, :],
-+        other=0.0,
-+    )
-+    rope_mask = (offs_d[:, None] < ROT) & key_mask[None, :]
++    rope_mask = (offs_d < ROT)[None, :]
++    partner = tl.where(x_part, offs_d + HALF_ROT, offs_d - HALF_ROT)
++    q = tl.load(q_rows + offs_d[None, :], mask=row_mask & (offs_d < HEAD_SIZE)[None, :],
++                other=0.0).to(tl.float32)
++    qp = tl.load(q_rows + partner[None, :], mask=row_mask & rope_mask, other=0.0)
++    qp = qp.to(tl.float32) * tl.where(x_part, -1.0, 1.0)[None, :]
 +    cos_idx = tl.where(x_part, offs_d, offs_d - HALF_ROT)
-+    cos = tl.load(
-+        cos_sin_cache_ptr
-+        + rel_pos[None, :] * stride_cs_cache_0
-+        + cos_idx[:, None] * stride_cs_cache_1,
-+        mask=rope_mask,
-+        other=1.0,
-+    ).to(tl.float32)
++    row = cos_sin_cache_ptr + tl.abs(shift)[:, None] * stride_cs_cache_0
++    cos = tl.load(row + cos_idx[None, :] * stride_cs_cache_1, mask=rope_mask, other=1.0)
 +    sin = tl.load(
-+        cos_sin_cache_ptr
-+        + rel_pos[None, :] * stride_cs_cache_0
-+        + (HALF_ROT + cos_idx[:, None]) * stride_cs_cache_1,
++        row + (HALF_ROT + cos_idx[None, :]) * stride_cs_cache_1,
 +        mask=rope_mask,
 +        other=0.0,
 +    ).to(tl.float32)
-+    rope_sign = tl.where(x_part, -1.0, 1.0)
-+    if K_raw.dtype.is_fp8():
-+        k_sc = tl.load(k_scale)
-+        K_raw_f = K_raw.to(tl.float32) * k_sc
-+        K_partner_f = K_partner.to(tl.float32) * k_sc
-+    else:
-+        K_raw_f = K_raw.to(tl.float32)
-+        K_partner_f = K_partner.to(tl.float32)
-+    return K_raw_f * cos + rope_sign[:, None] * K_partner_f * sin
-+
-+
-+@triton.jit
-+def kernel_rotate_k_prepass(
-+    # SPANS prerotate: rotate the batch's K ONCE into a transient scratch;
-+    # the attention kernel then reads it with FUSE_ROPE off.
-+    key_cache_ptr,
-+    scratch_ptr,
-+    block_tables_ptr,
-+    k_scratch_tables_ptr,
-+    seq_lens_ptr,
-+    cos_sin_cache_ptr,
-+    attn_lower_bounds_ptr,
-+    req_kv_starts_ptr,
-+    block_table_stride: tl.int64,
-+    scratch_table_stride: tl.int64,
-+    stride_k_cache_0: tl.int64,
-+    stride_k_cache_1: tl.int64,
-+    stride_k_cache_2: tl.int64,
-+    stride_k_cache_3: tl.constexpr,
-+    stride_scr_0: tl.int64,
-+    stride_scr_1: tl.int64,
-+    stride_scr_2: tl.int64,
-+    stride_scr_3: tl.constexpr,
-+    stride_cs_cache_0: tl.int64,
-+    stride_cs_cache_1: tl.constexpr,
-+    BLOCK_SIZE: tl.constexpr,
-+    HEAD_SIZE: tl.constexpr,
-+    HEAD_SIZE_PADDED: tl.constexpr,
-+    ROTARY_DIM: tl.constexpr,  # 0 means rotary_dim == head_size
-+    USE_SPAN: tl.constexpr,
-+):
-+    seq_idx = tl.program_id(0)
-+    blk_j = tl.program_id(1)
-+    kv_head_idx = tl.program_id(2)
-+
-+    seq_len = tl.load(seq_lens_ptr + seq_idx)
-+    if blk_j * BLOCK_SIZE >= seq_len:
-+        return
-+
-+    src_blk = tl.load(block_tables_ptr + seq_idx * block_table_stride + blk_j).to(
-+        tl.int64
-+    )
-+    dst_blk = tl.load(k_scratch_tables_ptr + seq_idx * scratch_table_stride + blk_j).to(
-+        tl.int64
-+    )
-+
-+    offs_s = tl.arange(0, BLOCK_SIZE)
-+    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
-+    pos = blk_j * BLOCK_SIZE + offs_s
-+    slot_mask = pos < seq_len
-+    dim_mask = offs_d < HEAD_SIZE
-+
-+    if USE_SPAN:
-+        req_kv_start = tl.load(req_kv_starts_ptr + seq_idx)
-+        key_lb = tl.load(
-+            attn_lower_bounds_ptr + req_kv_start + pos, mask=slot_mask, other=0
-+        )
-+    else:
-+        key_lb = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
-+
-+    k_base = (
-+        src_blk * stride_k_cache_0
-+        + kv_head_idx * stride_k_cache_2
-+        + offs_s * stride_k_cache_1
-+    )
-+    # k_scale arg is a never-dereferenced stand-in (host gates out fp8)
-+    K_rot = _load_rotate_k(
-+        key_cache_ptr,
-+        k_base,
-+        pos - key_lb,
-+        slot_mask,
-+        offs_d,
-+        key_cache_ptr,
-+        cos_sin_cache_ptr,
-+        stride_k_cache_3,
-+        stride_cs_cache_0,
-+        stride_cs_cache_1,
-+        HEAD_SIZE,
-+        ROTARY_DIM,
-+    )
-+
-+    dst_offset = (
-+        dst_blk * stride_scr_0
-+        + kv_head_idx * stride_scr_2
-+        + offs_d[:, None] * stride_scr_3
-+        + offs_s[None, :] * stride_scr_1
-+    )
-+    tl.store(
-+        scratch_ptr + dst_offset,
-+        K_rot.to(scratch_ptr.dtype.element_ty),
-+        mask=dim_mask[:, None] & slot_mask[None, :],
-+    )
-+
-+
-+def rotate_k_prepass(
-+    key_cache: torch.Tensor,
-+    k_scratch: torch.Tensor,
-+    block_table: torch.Tensor,
-+    k_scratch_block_table: torch.Tensor,
-+    seq_lens: torch.Tensor,
-+    max_seq_len: int,
-+    cos_sin_cache: torch.Tensor,
-+    rotary_dim: int,
-+    attn_lower_bounds: torch.Tensor | None,
-+    req_kv_starts: torch.Tensor | None,
-+) -> None:
-+    # per-forward K rotation into the transient scratch
-+    num_seqs = seq_lens.shape[0]
-+    grid = (
-+        num_seqs,
-+        triton.cdiv(max_seq_len, key_cache.shape[1]),
-+        key_cache.shape[2],
-+    )
-+    kernel_rotate_k_prepass[grid](
-+        key_cache,
-+        k_scratch,
-+        block_table,
-+        k_scratch_block_table,
-+        seq_lens,
-+        cos_sin_cache,
-+        attn_lower_bounds,
-+        req_kv_starts,
-+        block_table.stride(0),
-+        k_scratch_block_table.stride(0),
-+        *key_cache.stride(),
-+        *k_scratch.stride(),
-+        *cos_sin_cache.stride(),
-+        BLOCK_SIZE=key_cache.shape[1],
-+        HEAD_SIZE=key_cache.shape[3],
-+        HEAD_SIZE_PADDED=triton.next_power_of_2(key_cache.shape[3]),
-+        ROTARY_DIM=rotary_dim,
-+        USE_SPAN=attn_lower_bounds is not None,
-+    )
++    sin = tl.where(shift[:, None] < 0, -sin, sin)
++    return q * cos.to(tl.float32) + qp * sin
 +
 +
  @triton.jit
  def kernel_unified_attention(
      # Output destination for the 2D path.  In 3D mode per-segment partials
-@@ -274,6 +471,24 @@ def kernel_unified_attention(
+@@ -274,6 +317,19 @@ def kernel_unified_attention(
      USE_TD: tl.constexpr = False,
      USE_TD_QO: tl.constexpr = False,
      Q_IS_FP8: tl.constexpr = False,
 +    # Fused span-relative RoPE (spans / Legolink). When ``FUSE_ROPE`` is set,
-+    # K is stored un-rotated and rotated here per-tile using ``cos_sin_cache``
-+    # indexed by span-relative key position; Q/K are loaded in halves and the
-+    # score is the sum of the two half dots. Disabled (constexpr False) leaves
++    # Q and K are cached at RoPE p - L (L = span start, 0 off-span); each run of
++    # keys with one L is scored with Q re-rotated by q_off - L (``_load_rotate_q``). Disabled (constexpr False) leaves
 +    # the upstream path untouched (dead-code-eliminated at compile time).
 +    cos_sin_cache_ptr=None,
 +    stride_cs_cache_0: tl.int64 = 0,
@@ -3730,81 +3912,78 @@ index f39e44286b..01215c15a3 100644
 +    attn_lower_bounds_ptr: torch.Tensor | None = None,  # SPANS: per-KV-pos lb
 +    req_kv_starts_ptr: torch.Tensor | None = None,  # SPANS: per-req KV start
 +    USE_SPAN: tl.constexpr = False,  # bool
-+    # SPANS prerotate: pre-rotated K scratch table; excludes FUSE_ROPE
-+    k_block_tables_ptr=None,
-+    k_block_table_stride: tl.int64 = 0,
-+    SEPARATE_K_TABLE: tl.constexpr = False,
  ):
      USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = KV_QUANT_MODE >= 2
      USE_FP8_Q_DESCALE: tl.constexpr = KV_QUANT_MODE == 1 and Q_IS_FP8
-@@ -283,6 +498,14 @@ def kernel_unified_attention(
+@@ -283,6 +339,9 @@ def kernel_unified_attention(
              BLOCK_SIZE % TILE_SIZE == 0,
              "USE_TD requires BLOCK_SIZE to be a multiple of TILE_SIZE",
          )
-+        tl.static_assert(
-+            not SEPARATE_K_TABLE,
-+            "SPANS prerotate (SEPARATE_K_TABLE) does not support the TD path",
-+        )
 +    tl.static_assert(
-+        not (SEPARATE_K_TABLE and FUSE_ROPE),
-+        "SEPARATE_K_TABLE carries pre-rotated K; FUSE_ROPE must be off",
++        USE_SPAN or not FUSE_ROPE, "FUSE_ROPE needs the span lb words (K at p - L)"
 +    )
  
      q_block_global_idx = tl.program_id(0)
      kv_head_idx = tl.program_id(1)
-@@ -398,15 +621,48 @@ def kernel_unified_attention(
+@@ -398,169 +457,224 @@ def kernel_unified_attention(
          CHUNK_SIZE,
      )
  
-+    # SPANS: skip whole KV tiles before the Q-block's smallest lower bound;
-+    # span_starts are block-aligned so span_offset is tile-aligned. This
-+    # narrows HEAD's ``loop_lo`` (already computed by compute_tile_loop_bounds
-+    # with sliding-window / mm-prefix / 3D-segment pruning) on top of those.
-+    span_offset: tl.int32 = 0
-+    if USE_SPAN:
-+        req_kv_start = tl.load(req_kv_starts_ptr + seq_idx)
-+        q_lb_vec = tl.load(
-+            attn_lower_bounds_ptr + req_kv_start + context_len + query_pos,
-+            mask=query_mask_0,
-+            other=INT32_MAX,
-+        )
-+        # all-masked Q-block: tl.min returns INT32_MAX; clamp so we don't overshoot.
-+        span_offset = tl.min(q_lb_vec)
-+        span_offset = tl.where(span_offset > max_seq_prefix_len, 0, span_offset)
-+        loop_lo = tl.maximum(loop_lo, span_offset // TILE_SIZE)
-+
-     # iterate through tiles (now limited to the sliding window range)
-     for j in range(loop_lo, loop_hi):
-         seq_offset = j * TILE_SIZE + offs_t
-         tile_mask = seq_offset < max_seq_prefix_len
- 
-+        if USE_SPAN:  # SPANS: per-key K-RoPE shift via the same flat array
-+            key_span_lb = tl.load(
-+                attn_lower_bounds_ptr + req_kv_start + seq_offset,
-+                mask=tile_mask,
-+                other=0,
-+            )
-+
-         physical_block_idx = tl.load(
-             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-         ).to(tl.int64)
- 
-+        if SEPARATE_K_TABLE:  # SPANS prerotate: K lives in the scratch
-+            k_physical_block_idx = tl.load(
-+                k_block_tables_ptr
-+                + seq_idx * k_block_table_stride
-+                + seq_offset // BLOCK_SIZE
-+            ).to(tl.int64)
-+        else:
-+            k_physical_block_idx = physical_block_idx
-+
-         if USE_TD:
-             # All TILE_SIZE slots within a single KV tile map to one
-             # physical block (guaranteed by ``BLOCK_SIZE % TILE_SIZE == 0``
-@@ -453,25 +709,52 @@ def kernel_unified_attention(
-                 + offs_d[None, :] * stride_v_cache_3
-                 + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-             )
+-    # iterate through tiles (now limited to the sliding window range)
+-    for j in range(loop_lo, loop_hi):
+-        seq_offset = j * TILE_SIZE + offs_t
+-        tile_mask = seq_offset < max_seq_prefix_len
+-
+-        physical_block_idx = tl.load(
+-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+-        ).to(tl.int64)
+-
+-        if USE_TD:
+-            # All TILE_SIZE slots within a single KV tile map to one
+-            # physical block (guaranteed by ``BLOCK_SIZE % TILE_SIZE == 0``
+-            # from the static_assert above), so load the block index as
+-            # a scalar instead of a broadcast reduction.
+-            offset_in_block = (j * TILE_SIZE) % BLOCK_SIZE
+-            physical_block_scalar = tl.load(
+-                block_tables_ptr + block_table_offset + (j * TILE_SIZE) // BLOCK_SIZE
+-            ).to(tl.int64)
+-            # K : (HEAD_SIZE, TILE_SIZE)
+-            K_load = _load_kv_tile_td(
+-                key_cache_ptr,
+-                physical_block_scalar,
+-                kv_head_idx,
+-                offset_in_block,
+-                stride_k_cache_0,
+-                stride_k_cache_1,
+-                stride_k_cache_2,
+-                stride_k_cache_3,
+-                BLOCK_SIZE,
+-                TILE_SIZE,
+-                HEAD_SIZE,
+-                HEAD_SIZE_PADDED,
+-            ).T
+-            # V : (TILE_SIZE, HEAD_SIZE)
+-            V_load = _load_kv_tile_td(
+-                value_cache_ptr,
+-                physical_block_scalar,
+-                kv_head_idx,
+-                offset_in_block,
+-                stride_v_cache_0,
+-                stride_v_cache_1,
+-                stride_v_cache_2,
+-                stride_v_cache_3,
+-                BLOCK_SIZE,
+-                TILE_SIZE,
+-                HEAD_SIZE,
+-                HEAD_SIZE_PADDED,
+-            )
+-        else:
+-            v_offset = (
+-                physical_block_idx[:, None] * stride_v_cache_0
+-                + kv_head_idx * stride_v_cache_2
+-                + offs_d[None, :] * stride_v_cache_3
+-                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+-            )
 -            k_offset = (
 -                physical_block_idx[None, :] * stride_k_cache_0
 -                + kv_head_idx * stride_k_cache_2
@@ -3817,34 +3996,151 @@ index f39e44286b..01215c15a3 100644
 -                mask=dim_mask[:, None] & tile_mask[None, :],
 -                other=0.0,
 -            )
-+            if FUSE_ROPE:
-+                # SPANS: span-local queries see span-relative keys, but
-+                # cross-tail queries (lb=0) must see absolute-position keys.
-+                key_pos_shift = (
-+                    tl.minimum(key_span_lb, span_offset) if USE_SPAN else span_offset
-+                )
-+                k_base = (
-+                    physical_block_idx * stride_k_cache_0
-+                    + kv_head_idx * stride_k_cache_2
-+                    + (seq_offset % BLOCK_SIZE) * stride_k_cache_1
-+                )
-+                K_rot = _load_rotate_k(
+-            # V : (TILE_SIZE, HEAD_SIZE)
+-            V_load = tl.load(
+-                value_cache_ptr + v_offset,
+-                mask=dim_mask[None, :] & tile_mask[:, None],
+-                other=0.0,
+-            )
+-        K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
+-        V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
+-
+-        # Per-(token, head) scales for INT8 / FP8 per-token-head modes.
+-        if USE_PER_TOKEN_HEAD_SCALES:
+-            scale_idx = (
+-                physical_block_idx * stride_ks_blk
+-                + (seq_offset % BLOCK_SIZE) * stride_ks_slot
+-                + kv_head_idx * stride_ks_head
+-            )
+-            k_token_head_scales = tl.load(
+-                k_scale_cache_ptr + scale_idx, mask=tile_mask, other=1.0
+-            )
+-            v_scale_idx = (
+-                physical_block_idx * stride_vs_blk
+-                + (seq_offset % BLOCK_SIZE) * stride_vs_slot
+-                + kv_head_idx * stride_vs_head
+-            )
+-            v_token_head_scales = tl.load(
+-                v_scale_cache_ptr + v_scale_idx, mask=tile_mask, other=1.0
++    # SPANS: skip whole KV tiles before the Q-block's smallest lower bound;
++    # span_starts are block-aligned so span_offset is tile-aligned. This
++    # narrows HEAD's ``loop_lo`` (already computed by compute_tile_loop_bounds
++    # with sliding-window / mm-prefix / 3D-segment pruning) on top of those.
++    span_offset: tl.int32 = 0
++    if USE_SPAN:
++        req_kv_start = tl.load(req_kv_starts_ptr + seq_idx)
++        q_word = tl.load(
++            attn_lower_bounds_ptr + req_kv_start + context_len + query_pos,
++            mask=query_mask_0,
++            other=0,
++        )
++        q_off = q_word & _SPANS_LB_MASK  # Q stored at RoPE p - q_off
++        q_lb = tl.where((q_word & _SPANS_FULLQ) != 0, 0, q_off)
++        # all-masked Q-block: tl.min returns INT32_MAX; clamp so we don't overshoot.
++        span_offset = tl.min(tl.where(query_mask_0, q_lb, INT32_MAX))
++        span_offset = tl.where(span_offset > max_seq_prefix_len, 0, span_offset)
++        loop_lo = tl.maximum(loop_lo, span_offset // TILE_SIZE)
++        if FUSE_ROPE:  # score frame per key L: R(q_off - L) Q, cached per L
++            q_rows = (
++                query_ptr
++                + query_offset_0[:, None] * query_stride_0
++                + query_offset_1[:, None] * query_stride_1
+             )
++            q_rmask = query_mask_0[:, None] & query_mask_1[:, None]
++
++    # SPANS: K is stored at RoPE p - L, so the keys run in maximal stretches of
++    # one L, each scored by a loop-invariant R(q_off - L) Q; one pass otherwise
++    run_lo = loop_lo * TILE_SIZE
++    key_hi = tl.minimum(loop_hi * TILE_SIZE, max_seq_prefix_len)
++    while run_lo < key_hi:
++        run_hi = key_hi
++        if FUSE_ROPE:
++            lb_base = attn_lower_bounds_ptr + req_kv_start
++            L_run = tl.load(lb_base + run_lo) & _SPANS_LB_MASK
++            scan = run_lo
++            while scan < run_hi:
++                offs_w = scan + tl.arange(0, SPANS_SCAN)
++                w = tl.load(lb_base + offs_w, mask=offs_w < run_hi, other=0)
++                brk = (offs_w < run_hi) & ((w & _SPANS_LB_MASK) != L_run)
++                run_hi = tl.minimum(run_hi, tl.min(tl.where(brk, offs_w, INT32_MAX)))
++                scan += SPANS_SCAN
++            Qs = _load_rotate_q(
++                q_rows, q_rmask, q_off - L_run, offs_d, cos_sin_cache_ptr,
++                stride_cs_cache_0, stride_cs_cache_1, HEAD_SIZE, ROTARY_DIM,
++            ).to(Q.dtype)
++        # iterate through tiles (now limited to the sliding window range)
++        for j in range(run_lo // TILE_SIZE, tl.cdiv(run_hi, TILE_SIZE)):
++            seq_offset = j * TILE_SIZE + offs_t
++            tile_mask = seq_offset < max_seq_prefix_len
++
++            physical_block_idx = tl.load(
++                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
++            ).to(tl.int64)
+ 
+-        query_abs_pos = context_len + query_pos[:, None]
+-        seq_mask = compute_kv_seq_mask(
+-            query_abs_pos,
+-            seq_offset,
+-            seq_idx,
+-            seq_len,
+-            mm_prefix_range_ptr,
+-            SLIDING_WINDOW,
+-            USE_MM_PREFIX,
+-            MAX_MM_RANGES,
+-            USE_CAUSAL,
+-            USE_PER_SEQ_CAUSAL,
+-            per_seq_causal_ptr,
+-            CHUNK_LOOKBACK,
+-            CHUNK_SIZE,
+-        )
++            if USE_TD:
++                # All TILE_SIZE slots within a single KV tile map to one
++                # physical block (guaranteed by ``BLOCK_SIZE % TILE_SIZE == 0``
++                # from the static_assert above), so load the block index as
++                # a scalar instead of a broadcast reduction.
++                offset_in_block = (j * TILE_SIZE) % BLOCK_SIZE
++                physical_block_scalar = tl.load(
++                    block_tables_ptr + block_table_offset + (j * TILE_SIZE) // BLOCK_SIZE
++                ).to(tl.int64)
++                # K : (HEAD_SIZE, TILE_SIZE)
++                K_load = _load_kv_tile_td(
 +                    key_cache_ptr,
-+                    k_base,
-+                    seq_offset - key_pos_shift,
-+                    tile_mask,
-+                    offs_d,
-+                    k_scale,
-+                    cos_sin_cache_ptr,
++                    physical_block_scalar,
++                    kv_head_idx,
++                    offset_in_block,
++                    stride_k_cache_0,
++                    stride_k_cache_1,
++                    stride_k_cache_2,
 +                    stride_k_cache_3,
-+                    stride_cs_cache_0,
-+                    stride_cs_cache_1,
++                    BLOCK_SIZE,
++                    TILE_SIZE,
 +                    HEAD_SIZE,
-+                    ROTARY_DIM,
-+                ).to(KV_COMPUTE_DTYPE)
++                    HEAD_SIZE_PADDED,
++                ).T
++                # V : (TILE_SIZE, HEAD_SIZE)
++                V_load = _load_kv_tile_td(
++                    value_cache_ptr,
++                    physical_block_scalar,
++                    kv_head_idx,
++                    offset_in_block,
++                    stride_v_cache_0,
++                    stride_v_cache_1,
++                    stride_v_cache_2,
++                    stride_v_cache_3,
++                    BLOCK_SIZE,
++                    TILE_SIZE,
++                    HEAD_SIZE,
++                    HEAD_SIZE_PADDED,
++                )
 +            else:
++                v_offset = (
++                    physical_block_idx[:, None] * stride_v_cache_0
++                    + kv_head_idx * stride_v_cache_2
++                    + offs_d[None, :] * stride_v_cache_3
++                    + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
++                )
 +                k_offset = (
-+                    k_physical_block_idx[None, :] * stride_k_cache_0
++                    physical_block_idx[None, :] * stride_k_cache_0
 +                    + kv_head_idx * stride_k_cache_2
 +                    + offs_d[:, None] * stride_k_cache_3
 +                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
@@ -3855,44 +4151,168 @@ index f39e44286b..01215c15a3 100644
 +                    mask=dim_mask[:, None] & tile_mask[None, :],
 +                    other=0.0,
 +                )
-             # V : (TILE_SIZE, HEAD_SIZE)
-             V_load = tl.load(
-                 value_cache_ptr + v_offset,
-                 mask=dim_mask[None, :] & tile_mask[:, None],
-                 other=0.0,
-             )
--        K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
-+        if not FUSE_ROPE:
++                # V : (TILE_SIZE, HEAD_SIZE)
++                V_load = tl.load(
++                    value_cache_ptr + v_offset,
++                    mask=dim_mask[None, :] & tile_mask[:, None],
++                    other=0.0,
++                )
 +            K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
-         V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
++            V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
++
++            # Per-(token, head) scales for INT8 / FP8 per-token-head modes.
++            if USE_PER_TOKEN_HEAD_SCALES:
++                scale_idx = (
++                    physical_block_idx * stride_ks_blk
++                    + (seq_offset % BLOCK_SIZE) * stride_ks_slot
++                    + kv_head_idx * stride_ks_head
++                )
++                k_token_head_scales = tl.load(
++                    k_scale_cache_ptr + scale_idx, mask=tile_mask, other=1.0
++                )
++                v_scale_idx = (
++                    physical_block_idx * stride_vs_blk
++                    + (seq_offset % BLOCK_SIZE) * stride_vs_slot
++                    + kv_head_idx * stride_vs_head
++                )
++                v_token_head_scales = tl.load(
++                    v_scale_cache_ptr + v_scale_idx, mask=tile_mask, other=1.0
++                )
  
-         # Per-(token, head) scales for INT8 / FP8 per-token-head modes.
-@@ -512,7 +795,9 @@ def kernel_unified_attention(
- 
-         # S : (BLOCK_M, TILE_SIZE)
-         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
+-        # S : (BLOCK_M, TILE_SIZE)
+-        S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
 -        if USE_PER_TOKEN_HEAD_SCALES:
-+        if FUSE_ROPE:
-+            S += score_scale * tl.dot(Q, K_rot)
-+        elif USE_PER_TOKEN_HEAD_SCALES:
-             # Per-token-head quant: fuse softmax_scale with per-head k_scale
-             # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
-             S += tl.dot(Q, K) * (score_scale * k_token_head_scales[None, :])
-@@ -818,15 +1103,49 @@ def unified_attention(
+-            # Per-token-head quant: fuse softmax_scale with per-head k_scale
+-            # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
+-            S += tl.dot(Q, K) * (score_scale * k_token_head_scales[None, :])
+-        else:
+-            S += score_scale * tl.dot(Q, K)
++            query_abs_pos = context_len + query_pos[:, None]
++            seq_mask = compute_kv_seq_mask(
++                query_abs_pos,
++                seq_offset,
++                seq_idx,
++                seq_len,
++                mm_prefix_range_ptr,
++                SLIDING_WINDOW,
++                USE_MM_PREFIX,
++                MAX_MM_RANGES,
++                USE_CAUSAL,
++                USE_PER_SEQ_CAUSAL,
++                per_seq_causal_ptr,
++                CHUNK_LOOKBACK,
++                CHUNK_SIZE,
++            )
+ 
+-        if USE_SOFTCAP:
+-            S = apply_softcap(S, softcap)
++            if USE_SPAN:
++                seq_mask = seq_mask & (seq_offset[None, :] >= q_lb[:, None])
++                if FUSE_ROPE:
++                    run_keys = (seq_offset >= run_lo) & (seq_offset < run_hi)
++                    seq_mask = seq_mask & run_keys[None, :]
++
++            # S : (BLOCK_M, TILE_SIZE)
++            S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
++            if FUSE_ROPE:
++                S += score_scale * tl.dot(Qs, K)
++            elif USE_PER_TOKEN_HEAD_SCALES:
++                # Per-token-head quant: fuse softmax_scale with per-head k_scale
++                # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
++                S += tl.dot(Q, K) * (score_scale * k_token_head_scales[None, :])
++            else:
++                S += score_scale * tl.dot(Q, K)
+ 
+-        S = tl.where(
+-            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
+-        )
++            if USE_SOFTCAP:
++                S = apply_softcap(S, softcap)
+ 
+-        if USE_ALIBI_SLOPES:
+-            S = apply_alibi_to_score(
+-                S, alibi_slope, seq_offset, context_len, query_pos, USE_ALIBI_SQRT
++            S = tl.where(
++                query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
+             )
+ 
+-        if USE_QQ_BIAS:
+-            S += load_qq_bias_tile(
+-                qq_bias_row_ptrs, seq_offset, context_len, qq_bias_stride_0
+-            )
++            if USE_ALIBI_SLOPES:
++                S = apply_alibi_to_score(
++                    S, alibi_slope, seq_offset, context_len, query_pos, USE_ALIBI_SQRT
++                )
+ 
+-        M, L, P, alpha = softmax_step(S, M, L)
+-        acc = acc * alpha[:, None]
+-
+-        if SLIDING_WINDOW:
+-            qpos_lo = q_block_local_idx * BLOCK_Q
+-            dist = context_len + qpos_lo - seq_offset[:, None]
+-            if USE_PER_SEQ_CAUSAL:
+-                is_causal_seq = tl.load(per_seq_causal_ptr + seq_idx)
+-                sw_mask_v = tl.where(
+-                    is_causal_seq,
+-                    dist < SLIDING_WINDOW,
+-                    (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW),
++            if USE_QQ_BIAS:
++                S += load_qq_bias_tile(
++                    qq_bias_row_ptrs, seq_offset, context_len, qq_bias_stride_0
+                 )
+-            elif USE_CAUSAL:
+-                sw_mask_v = dist < SLIDING_WINDOW
++
++            M, L, P, alpha = softmax_step(S, M, L)
++            acc = acc * alpha[:, None]
++
++            if SLIDING_WINDOW:
++                qpos_lo = q_block_local_idx * BLOCK_Q
++                dist = context_len + qpos_lo - seq_offset[:, None]
++                if USE_PER_SEQ_CAUSAL:
++                    is_causal_seq = tl.load(per_seq_causal_ptr + seq_idx)
++                    sw_mask_v = tl.where(
++                        is_causal_seq,
++                        dist < SLIDING_WINDOW,
++                        (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW),
++                    )
++                elif USE_CAUSAL:
++                    sw_mask_v = dist < SLIDING_WINDOW
++                else:
++                    sw_mask_v = (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW)
++                V = tl.where(sw_mask_v, V, 0.0)
++            if USE_PER_TOKEN_HEAD_SCALES:
++                # Per-token-head quant: apply v_scale to P instead of V.
++                P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
++                acc += tl.dot(P_v, V)
+             else:
+-                sw_mask_v = (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW)
+-            V = tl.where(sw_mask_v, V, 0.0)
+-        if USE_PER_TOKEN_HEAD_SCALES:
+-            # Per-token-head quant: apply v_scale to P instead of V.
+-            P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
+-            acc += tl.dot(P_v, V)
+-        else:
+-            acc += tl.dot(P.to(V.dtype), V)
++                acc += tl.dot(P.to(V.dtype), V)
+ 
++        run_lo = run_hi
+     # ---- Epilogue ---------------------------------------------------------
+     if IS_3D:
+         if USE_FP8_Q_DESCALE:
+@@ -818,15 +932,37 @@ def unified_attention(
      # The non-TD branch is dead-code-eliminated at Triton compile time so
      # disabling this flag costs nothing.
      use_td: bool = False,
 +    # Fused span-relative RoPE (spans / Legolink). When ``cos_sin_cache`` is
-+    # provided, K is stored un-rotated and rotated inside the kernel using
-+    # ``cos_sin_cache`` indexed by span-relative key position. ``rotary_dim``
++    # provided, Q and K are cached at RoPE p - L and Q is re-rotated per run of
++    # keys with one L. ``rotary_dim``
 +    # of 0 means rotary_dim == head_size (full rotary).
 +    cos_sin_cache=None,
 +    rotary_dim=0,
 +    attn_lower_bounds=None,  # SPANS: flat per-KV-pos lower bound
 +    req_kv_starts=None,  # SPANS: per-req start into attn_lower_bounds
-+    # SPANS prerotate: pre-rotated K scratch + its block table
-+    k_scratch=None,
-+    k_scratch_block_table=None,
  ):
      # Resolve causal: bool or per-seq tensor.
      use_per_seq_causal = isinstance(causal, torch.Tensor)
@@ -3905,15 +4325,6 @@ index f39e44286b..01215c15a3 100644
          assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
  
 +    fuse_rope = cos_sin_cache is not None
-+    separate_k_table = k_scratch is not None
-+    if separate_k_table:
-+        assert not fuse_rope, "prerotated K scratch excludes fused RoPE"
-+        assert k_scratch_block_table is not None
-+        assert kv_quant_mode == KVQuantMode.NONE, (
-+            "SPANS prerotate supports unquantized KV caches only"
-+        )
-+    # K is read from the scratch when prerotated; V always from the cache.
-+    k_read = k_scratch if separate_k_table else k
 +    # Compute dtype for in-kernel RoPE + key cast, matching the layer-side RoPE
 +    # dtype. For fp8 caches keep fp16 (the dequant path lands there).
 +    if k.dtype == torch.bfloat16:
@@ -3928,31 +4339,19 @@ index f39e44286b..01215c15a3 100644
      use_per_token_head_scales = kv_quant_mode in (
          KVQuantMode.INT8_PER_TOKEN_HEAD,
          KVQuantMode.FP8_PER_TOKEN_HEAD,
-@@ -1022,7 +1341,7 @@ def unified_attention(
-         segm_max_ptr=segm_max_ptr,
-         segm_expsum_ptr=segm_expsum_ptr,
-         query_ptr=q,
--        key_cache_ptr=k,
-+        key_cache_ptr=k_read,
-         value_cache_ptr=v,
-         sink_ptr=sinks,
-         block_tables_ptr=block_table,
-@@ -1061,10 +1380,10 @@ def unified_attention(
-         USE_MM_PREFIX=use_mm_prefix,
-         MAX_MM_RANGES=max_mm_ranges,
-         mm_prefix_range_ptr=mm_prefix_range,
--        stride_k_cache_0=k.stride(0),
--        stride_k_cache_1=k.stride(1),
--        stride_k_cache_2=k.stride(2),
--        stride_k_cache_3=k.stride(3),
-+        stride_k_cache_0=k_read.stride(0),
-+        stride_k_cache_1=k_read.stride(1),
-+        stride_k_cache_2=k_read.stride(2),
-+        stride_k_cache_3=k_read.stride(3),
-         stride_v_cache_0=v.stride(0),
-         stride_v_cache_1=v.stride(1),
-         stride_v_cache_2=v.stride(2),
-@@ -1088,6 +1407,20 @@ def unified_attention(
+@@ -1010,7 +1146,11 @@ def unified_attention(
+         grid = (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
+         tile_size = TILE_SIZE_DECODE
+ 
++    if fuse_rope and use_span and launch_num_stages is None:
++        launch_num_stages = 2  # SPANS: 3 stages spill the per-run Q rotation
+     launch_kwargs: dict[str, int] = {}
++    if fuse_rope and use_span and head_size <= 128:
++        launch_kwargs["maxnreg"] = 128  # SPANS: R(q_off - L) Q lifts B to 146 regs, 3 CTAs/SM instead of 4
+     if launch_num_warps is not None:
+         launch_kwargs["num_warps"] = launch_num_warps
+     if launch_num_stages is not None:
+@@ -1088,6 +1228,15 @@ def unified_attention(
          CHUNK_SIZE=chunk_size,
          USE_TD=use_td,
          USE_TD_QO=use_td_qo,
@@ -3965,20 +4364,15 @@ index f39e44286b..01215c15a3 100644
 +        attn_lower_bounds_ptr=attn_lower_bounds,
 +        req_kv_starts_ptr=req_kv_starts,
 +        USE_SPAN=use_span,
-+        k_block_tables_ptr=k_scratch_block_table,
-+        k_block_table_stride=(
-+            k_scratch_block_table.stride(0) if separate_k_table else 0
-+        ),
-+        SEPARATE_K_TABLE=separate_k_table,
          **launch_kwargs,
      )
  
 diff --git a/vllm/v1/attention/qcfuse.py b/vllm/v1/attention/qcfuse.py
 new file mode 100644
-index 0000000000..eeb140aab3
+index 0000000000..d32524b4d6
 --- /dev/null
 +++ b/vllm/v1/attention/qcfuse.py
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,198 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""QCFuse importance probe.
@@ -4046,7 +4440,7 @@ index 0000000000..eeb140aab3
 +    def begin_step(self, block_table: torch.Tensor | None, descs: list) -> None:
 +        self.block_table = block_table
 +        self.descs = descs
-+        for row, _, _, ctx_len, _, _ in descs:
++        for row, _, _, ctx_len, *_ in descs:
 +            self.buffer[row, :ctx_len].zero_()
 +
 +    def end_step(self) -> None:
@@ -4066,7 +4460,7 @@ index 0000000000..eeb140aab3
 +        if not self.descs or block_table is None:
 +            return
 +        if envs.VLLM_V1_SPANS_ENABLED and cos_sin_cache is None:
-+            # SPANS caches K unrotated: scoring it against rotated Q is wrong
++            # SPANS caches Q and K at p - L: the probe must rotate them back
 +            raise RuntimeError("QCFuse probe under SPANS needs the layer's RoPE cache")
 +        rope = (cos_sin_cache, rotary_dim) if cos_sin_cache is not None else None
 +        # K/V-first (2, n_blocks, ...) or blocks-first (n_blocks, 2, ...)
@@ -4082,7 +4476,7 @@ index 0000000000..eeb140aab3
 +            )
 +        key_cache = kv_cache[0] if kv_cache.shape[0] == 2 else kv_cache[:, 0]
 +        bs = key_cache.shape[1]
-+        for row, q_start, q_end, ctx_len, span_blocks, q_pos0 in self.descs:
++        for row, q_start, q_end, ctx_len, span_blocks, q_pos0, raw in self.descs:
 +            n_blk = min(ctx_len // bs, block_table.shape[1])
 +            if n_blk <= 0 or q_end <= q_start:
 +                continue
@@ -4092,6 +4486,7 @@ index 0000000000..eeb140aab3
 +            # mean-pool each GQA group onto its KV head
 +            q = q.view(nq, n_kv, num_queries_per_kv, head_dim).mean(2)
 +            q_pos = q_pos0 + torch.arange(nq, device=q.device)
++            q = self._rope(q, q_pos, rope, raw)
 +            if span_blocks is not None:
 +                # SPANFUSE: normalize over the span blocks only, not the prefix
 +                idx = torch.tensor(
@@ -4105,7 +4500,9 @@ index 0000000000..eeb140aab3
 +                    idx[:, None] * bs + torch.arange(bs, device=idx.device)
 +                ).flatten()
 +                k_ctx = key_cache[block_table[row, idx].long()].flatten(0, 1).float()
-+                mass = self._mass(q, self._rope(k_ctx, pos, rope), scale, q_pos, pos)
++                mass = self._mass(
++                    q, self._rope(k_ctx, pos, rope, raw), scale, q_pos, pos
++                )
 +                self.buffer[row].index_add_(0, pos.to(self.buffer.device), mass)
 +                if envs.VLLM_V1_SPANS_SPANFUSE_NORM_CHECK:
 +                    self._log_norm_check(
@@ -4117,6 +4514,7 @@ index 0000000000..eeb140aab3
 +                        mass,
 +                        scale,
 +                        rope,
++                        raw,
 +                    )
 +                continue
 +            blk_ids = block_table[row, :n_blk].long()
@@ -4124,15 +4522,16 @@ index 0000000000..eeb140aab3
 +            k_ctx = key_cache[blk_ids].flatten(0, 1).float()
 +            pos = torch.arange(n_blk * bs, device=k_ctx.device)
 +            self.buffer[row, : n_blk * bs] += self._mass(
-+                q, self._rope(k_ctx, pos, rope), scale, q_pos, pos
++                q, self._rope(k_ctx, pos, rope, raw), scale, q_pos, pos
 +            )
 +
 +    @staticmethod
-+    def _rope(k, pos, rope):
-+        """Neox-rotate K to its absolute position, as the span kernel does for
-+        the tail (lb=0) rows the probe scores from (_load_rotate_k)."""
-+        if rope is None:
++    def _rope(k, pos, rope, raw=None):
++        """Neox-rotate Q or K, cached at p - L, back to p (raw = L per position).
++        Off-span L is 0: the identity."""
++        if rope is None or raw is None:
 +            return k
++        pos = raw[pos.to(raw.device)].long()
 +        cos_sin_cache, rotary_dim = rope
 +        d = k.shape[-1]
 +        rot = d if rotary_dim <= 0 or rotary_dim > d else rotary_dim
@@ -4151,11 +4550,11 @@ index 0000000000..eeb140aab3
 +        return scores.softmax(dim=-1).nan_to_num(0.0).sum(dim=(0, 1))
 +
 +    def _log_norm_check(
-+        self, q, q_pos, key_cache, blk_row, pos, mass, scale, rope
++        self, q, q_pos, key_cache, blk_row, pos, mass, scale, rope, raw=None
 +    ) -> None:
 +        k_all = key_cache[blk_row.long()].flatten(0, 1).float()
 +        ar = torch.arange(k_all.shape[0], device=k_all.device)
-+        full = self._mass(q, self._rope(k_all, ar, rope), scale, q_pos, ar)[pos]
++        full = self._mass(q, self._rope(k_all, ar, rope, raw), scale, q_pos, ar)[pos]
 +        n = max(1, pos.numel() // 10)
 +        a = set(mass.topk(n).indices.tolist())
 +        b = set(full.topk(n).indices.tolist())
@@ -4214,7 +4613,7 @@ index 4202f52708..1e75e7d1aa 100644
          if prepend:
              self.free_block_queue.prepend_n(freed_blocks)
 diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
-index 376f65f669..3b245e3296 100644
+index 376f65f669..63645489c4 100644
 --- a/vllm/v1/core/kv_cache_coordinator.py
 +++ b/vllm/v1/core/kv_cache_coordinator.py
 @@ -12,9 +12,11 @@ from vllm.v1.core.kv_cache_utils import (
@@ -4229,7 +4628,7 @@ index 376f65f669..3b245e3296 100644
      SingleTypeKVCacheManager,
      get_manager_for_kv_cache_spec,
  )
-@@ -486,6 +488,52 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
+@@ -486,6 +488,59 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
          )
          return hit_blocks, len(hit_blocks[0]) * self.block_size
  
@@ -4274,6 +4673,13 @@ index 376f65f669..3b245e3296 100644
 +                continue
 +            computed.append(block[0])
 +            sources.append(source)
++        if request.spanfuse_seed:
++            # a span whose hits stop inside it (a shared tool-call header) is cold: seed all of it
++            for s, e in request.pic_token_ranges:
++                blk = range(s // bs, min(len(sources), (e or request.num_tokens) // bs))
++                if blk and sources[blk[-1]] == PrefixHitSource.MISS:
++                    for b in blk:
++                        computed[b], sources[b] = self.block_pool.null_block, PrefixHitSource.MISS
 +        while sources and sources[-1] == PrefixHitSource.MISS:
 +            computed.pop()
 +            sources.pop()
@@ -4283,10 +4689,15 @@ index 376f65f669..3b245e3296 100644
  class SpecGroup(NamedTuple):
      """KV cache groups that share one spec, batched together for a single
 diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
-index b0f6655bf9..30f6c3e318 100644
+index b0f6655bf9..acec597a26 100644
 --- a/vllm/v1/core/kv_cache_manager.py
 +++ b/vllm/v1/core/kv_cache_manager.py
-@@ -10,7 +10,7 @@ from vllm.distributed.kv_events import BlockStored, KVCacheEvent
+@@ -6,11 +6,12 @@ from collections.abc import Sequence
+ from dataclasses import dataclass
+ from typing import Literal, overload
+ 
++from vllm import envs
+ from vllm.distributed.kv_events import BlockStored, KVCacheEvent
  from vllm.logger import init_logger
  from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
  from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
@@ -4295,7 +4706,17 @@ index b0f6655bf9..30f6c3e318 100644
  from vllm.v1.kv_cache_interface import (
      KVCacheConfig,
      get_kv_cache_spec_kind,
-@@ -225,17 +225,36 @@ class KVCacheManager:
+@@ -174,6 +175,9 @@ class KVCacheManager:
+         # overhead.
+         #
+         # We use nested tuples to ensure the empty KVCacheBlocks is immutable.
++        # SPANSHIFT: (req, span_starts, block idx, blind ids, fresh ids) per swap
++        self.spanshift_pairs: list[tuple] = []
++        self.spanshift_held: list[KVCacheBlock] = []
+         self.empty_kv_cache_blocks = KVCacheBlocks(
+             tuple(() for _ in range(self.num_kv_cache_groups))
+         )
+@@ -225,17 +229,36 @@ class KVCacheManager:
          # num_computed_tokens to be block-size aligned. Removing this limitation
          # could slightly improve performance in the future.
          max_cache_hit_length = request.num_tokens - 1
@@ -4337,7 +4758,7 @@ index b0f6655bf9..30f6c3e318 100644
                  preempted=request.num_preemptions > 0,
              )
  
-@@ -254,6 +273,7 @@ class KVCacheManager:
+@@ -254,6 +277,7 @@ class KVCacheManager:
          full_sequence_must_fit: bool = False,
          reserved_blocks: int = 0,
          has_scheduled_reqs: bool = True,
@@ -4345,7 +4766,7 @@ index b0f6655bf9..30f6c3e318 100644
      ) -> KVCacheBlocks | None:
          """Add slots for a request with new tokens to append.
  
-@@ -286,6 +306,9 @@ class KVCacheManager:
+@@ -286,6 +310,9 @@ class KVCacheManager:
                  blocks an already in-flight (prefilling) sequence is relying on.
              has_scheduled_reqs: Whether any requests are already scheduled to run
                  this step, controls whether watermark is applied.
@@ -4355,7 +4776,7 @@ index b0f6655bf9..30f6c3e318 100644
  
          Blocks layout:
          ```
-@@ -339,12 +362,15 @@ class KVCacheManager:
+@@ -339,12 +366,15 @@ class KVCacheManager:
          """
          # When loading KV data asynchronously, we may have zero new tokens to
          # compute while still allocating slots for externally computed tokens.
@@ -4372,7 +4793,7 @@ index b0f6655bf9..30f6c3e318 100644
          if new_computed_blocks is not None:
              new_computed_block_list = new_computed_blocks.blocks
          else:
-@@ -382,7 +408,9 @@ class KVCacheManager:
+@@ -382,7 +412,9 @@ class KVCacheManager:
                  num_tokens_main_model=full_num_tokens,
                  apply_admission_cap=True,
              )
@@ -4383,7 +4804,7 @@ index b0f6655bf9..30f6c3e318 100644
              if required_blocks > self.block_pool.get_num_free_blocks():
                  return None
  
-@@ -414,7 +442,7 @@ class KVCacheManager:
+@@ -414,7 +446,7 @@ class KVCacheManager:
          # Keep `reserved_blocks` free for other in-flight sequences, and an
          # additional watermark of headroom for waiting/preempted admissions.
          available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
@@ -4392,7 +4813,7 @@ index b0f6655bf9..30f6c3e318 100644
          if required_blocks > available_blocks:
              # Cannot allocate new blocks
              return None
-@@ -441,7 +469,7 @@ class KVCacheManager:
+@@ -441,7 +473,7 @@ class KVCacheManager:
  
          # P/D: delay caching blocks if we have to recv from
          # remote. Update state for locally cached blocks.
@@ -4401,7 +4822,7 @@ index b0f6655bf9..30f6c3e318 100644
              return self.create_kv_cache_blocks(new_blocks)
  
          # NOTE(woosuk): We want to commit (cache) up to num_local_computed_tokens
-@@ -453,10 +481,45 @@ class KVCacheManager:
+@@ -453,10 +485,64 @@ class KVCacheManager:
              total_computed_tokens + num_new_tokens,
              request.num_tokens,
          )
@@ -4414,20 +4835,39 @@ index b0f6655bf9..30f6c3e318 100644
 +            # SPANS: fresh pd-keyed blocks for the gap recompute; the shared
 +            # warmed (pic) blocks are left untouched for other prefixes.
 +            manager = self.coordinator.single_type_managers[0]
-+            fresh = manager.swap_blocks_for_gap_recompute(  # type: ignore[attr-defined]
-+                request.request_id, swap_indices
-+            )
++            hold = [] if envs.VLLM_V1_SPANS_SHIFT_DUMP else None
 +            bs = self.coordinator.block_size  # type: ignore[attr-defined]
-+            assert request.span_starts and request.pd_block_hashes is not None
-+            first = min(request.span_starts)
-+            # the key the dual lookup tries first: pd from the first span start on
-+            hashes = [
-+                request.pd_block_hashes[i]
-+                if i * bs >= first
-+                else request.block_hashes[i]
-+                for i in swap_indices
-+            ]
-+            self.block_pool.cache_blocks_under_hashes(fresh, hashes, 0)
++            fresh = manager.swap_blocks_for_gap_recompute(  # type: ignore[attr-defined]
++                request.request_id, swap_indices, hold
++            )
++            if hold is not None:
++                # SPANSHIFT: blind copies stay alive until the next schedule()
++                self.spanshift_held.extend(hold)
++                self.spanshift_pairs.append(
++                    (
++                        request.request_id,
++                        list(request.span_starts or ()),
++                        list(swap_indices),
++                        [b.block_id for b in hold],
++                        [b.block_id for b in fresh],
++                        [str(request.prefix_hit_sources[i]) for i in swap_indices],
++                        [request.all_token_ids[i * bs : (i + 1) * bs] for i in swap_indices],
++                    )
++                )
++            # SPANFUSE: a probe's MISS copies are rewritten in place at repair, so
++            # they stay private to this request
++            if not delay_cache_blocks:
++                bs = self.coordinator.block_size  # type: ignore[attr-defined]
++                assert request.span_starts and request.pd_block_hashes is not None
++                first = min(request.span_starts)
++                # the key the dual lookup tries first: pd from the first span start on
++                hashes = [
++                    request.pd_block_hashes[i]
++                    if i * bs >= first
++                    else request.block_hashes[i]
++                    for i in swap_indices
++                ]
++                self.block_pool.cache_blocks_under_hashes(fresh, hashes, 0)
  
          return self.create_kv_cache_blocks(new_blocks)
  
@@ -4449,10 +4889,18 @@ index b0f6655bf9..30f6c3e318 100644
          """Free the blocks allocated for the request.
          We free the blocks in reverse order so that the tail blocks are evicted
 diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
-index 72ca6a2fa6..462de93dc2 100644
+index 72ca6a2fa6..00ed068cc2 100644
 --- a/vllm/v1/core/kv_cache_utils.py
 +++ b/vllm/v1/core/kv_cache_utils.py
-@@ -9,6 +9,7 @@ import os
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """KV-Cache Utilities."""
+ 
++import bisect
+ import copy
+ import hashlib
+ import math
+@@ -9,6 +10,7 @@ import os
  from collections import defaultdict
  from collections.abc import Callable, Iterable, Iterator, Sequence
  from dataclasses import dataclass, replace
@@ -4460,7 +4908,7 @@ index 72ca6a2fa6..462de93dc2 100644
  from functools import partial
  from typing import Any, NewType, TypeAlias, cast, overload
  
-@@ -92,11 +93,24 @@ logger = init_logger(__name__)
+@@ -92,11 +94,24 @@ logger = init_logger(__name__)
  #
  # The function `init_none_hash` initializes this variable globally.
  NONE_HASH: BlockHash
@@ -4486,7 +4934,7 @@ index 72ca6a2fa6..462de93dc2 100644
  
      hash_seed = os.getenv("PYTHONHASHSEED")
      if hash_seed is None and hash_fn in _CBOR_HASH_FUNCTIONS:
-@@ -111,6 +125,7 @@ def init_none_hash(hash_fn: Callable[[Any], bytes]):
+@@ -111,6 +126,7 @@ def init_none_hash(hash_fn: Callable[[Any], bytes]):
          NONE_HASH = BlockHash(os.urandom(32))
      else:
          NONE_HASH = BlockHash(hash_fn(hash_seed))
@@ -4494,7 +4942,15 @@ index 72ca6a2fa6..462de93dc2 100644
  
  
  @dataclass(slots=True)
-@@ -565,6 +580,7 @@ def hash_block_tokens(
+@@ -560,11 +576,15 @@ def generate_block_hash_extra_keys(
+     return tuple(extra_keys), new_start_mm_idx
+ 
+ 
++SPANS_RAW_KEY = "spans_raw_k"
++
++
+ def hash_block_tokens(
+     hash_function: Callable[[Any], bytes],
      parent_block_hash: BlockHash | None,
      curr_block_token_ids: Sequence[int],
      extra_keys: tuple[Any, ...] | None = None,
@@ -4502,7 +4958,7 @@ index 72ca6a2fa6..462de93dc2 100644
  ) -> BlockHash:
      """Computes a hash value corresponding to the contents of a block and
      the contents of the preceding block(s). The hash value is used for
-@@ -577,11 +593,12 @@ def hash_block_tokens(
+@@ -577,11 +597,12 @@ def hash_block_tokens(
          curr_block_token_ids: A list of token ids in the current
              block. The current block is assumed to be full.
          extra_keys: Extra keys for the block.
@@ -4516,7 +4972,7 @@ index 72ca6a2fa6..462de93dc2 100644
          parent_block_hash = NONE_HASH
  
      curr_block_token_ids_tuple = tuple(curr_block_token_ids)
-@@ -590,6 +607,17 @@ def hash_block_tokens(
+@@ -590,6 +611,17 @@ def hash_block_tokens(
      )
  
  
@@ -4534,7 +4990,7 @@ index 72ca6a2fa6..462de93dc2 100644
  def resolve_kv_cache_block_sizes(
      kv_cache_config: KVCacheConfig,
      vllm_config: VllmConfig,
-@@ -672,6 +700,26 @@ def get_request_block_hasher(
+@@ -672,6 +704,26 @@ def get_request_block_hasher(
              # Early stop when there no new full blocks created.
              return []
  
@@ -4561,7 +5017,7 @@ index 72ca6a2fa6..462de93dc2 100644
          curr_mm_idx = 0
          if start_token_idx > 0:
              # Set curr_mm_idx = -1 to indicate the last mm input.
-@@ -683,7 +731,13 @@ def get_request_block_hasher(
+@@ -683,7 +735,25 @@ def get_request_block_hasher(
          prev_block_hash_value = (
              request.block_hashes[-1] if request.block_hashes else None
          )
@@ -4570,32 +5026,52 @@ index 72ca6a2fa6..462de93dc2 100644
 +        prev_pd_hash_value = (
 +            request.pd_block_hashes[-1] if request.pd_block_hashes else PD_NONE_HASH
 +        )
++        spans_sorted = sorted(span_starts_set)
++        crosses_sorted = sorted(cross_starts_set)
++
++        def block_in_span(idx: int) -> bool:
++            # same rule as compute_span_lb_regions: a span runs to the next
++            # span start or the first cross after it
++            j = bisect.bisect_right(spans_sorted, idx)
++            if j == 0:
++                return False
++            c = bisect.bisect_right(crosses_sorted, idx)
++            return c == 0 or spans_sorted[j - 1] >= crosses_sorted[c - 1]
++
          new_block_hashes: list[BlockHash] = []
 +        new_pd_block_hashes: list[BlockHash] = []
          while True:
              end_token_idx = start_token_idx + block_size
              if end_token_idx > num_tokens:
-@@ -697,14 +751,38 @@ def get_request_block_hasher(
- 
+@@ -694,17 +764,45 @@ def get_request_block_hasher(
+             extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
+                 request, start_token_idx, end_token_idx, curr_mm_idx
+             )
+-
              # Compute the hash of the current block
              block_tokens = request.all_token_ids[start_token_idx:end_token_idx]
 +
 +            if track_pd:
++                pd_keys = extra_keys
++                if block_in_span(start_token_idx):
++                    # pd chain runs from 0, but span K is cached at p - span_start
++                    pd_keys = (*(extra_keys or ()), SPANS_RAW_KEY)
 +                pd_block_hash = hash_block_tokens(
 +                    caching_hash_fn,
 +                    prev_pd_hash_value,
 +                    block_tokens,
-+                    extra_keys,
++                    pd_keys,
 +                )
 +                new_pd_block_hashes.append(pd_block_hash)
 +                prev_pd_hash_value = pd_block_hash
 +
-+            is_cross_span = start_token_idx in cross_starts_set
-+            extra_keys = recompute_token_handler(
-+                request.all_token_ids[:start_token_idx],
-+                extra_keys,
-+                is_cross_span=is_cross_span,
-+            )
++            # slice the prefix only for a cross: copying it on every block is O(n^2)
++            if start_token_idx in cross_starts_set:
++                extra_keys = recompute_token_handler(
++                    request.all_token_ids[:start_token_idx],
++                    extra_keys,
++                    is_cross_span=True,
++                )
 +
 +            is_span_start = start_token_idx in span_starts_set
              block_hash = hash_block_tokens(
@@ -4632,10 +5108,10 @@ index d1c652c46e..84672f1fac 100644
  
 diff --git a/vllm/v1/core/sched/gap_policy.py b/vllm/v1/core/sched/gap_policy.py
 new file mode 100644
-index 0000000000..d19631907b
+index 0000000000..89604cc0c2
 --- /dev/null
 +++ b/vllm/v1/core/sched/gap_policy.py
-@@ -0,0 +1,767 @@
+@@ -0,0 +1,1160 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""
@@ -4647,11 +5123,13 @@ index 0000000000..d19631907b
 +"""
 +
 +from abc import ABC, abstractmethod
++from collections import Counter
 +from dataclasses import replace
 +from typing import TYPE_CHECKING
 +
 +from vllm import envs
 +from vllm.logger import init_logger
++from vllm.utils.math_utils import cdiv
 +from vllm.v1.attention.qcfuse import QCFUSE_MAX_QUERY_TOKENS, spanfuse_query_ids
 +from vllm.v1.core.kv_cache_utils import PrefixHitSource
 +from vllm.v1.core.sched.output import NewRequestData
@@ -4760,6 +5238,23 @@ index 0000000000..d19631907b
 +            request_queue.pop_request()
 +            step_skipped_waiting.prepend_request(request)
 +            return token_budget
++        if state is None and did_prefix_lookup and not request.spanfuse_otf_warmed:
++            warmed = _schedule_spanfuse_otf_warm(
++                sched,
++                request,
++                num_computed_tokens,
++                num_external_computed_tokens,
++                num_new_local_computed_tokens,
++                new_computed_blocks,
++                token_budget,
++                num_scheduled_tokens,
++                virtual_reqs_out,
++                virtual_gap_req_ids,
++                request_queue,
++                step_skipped_waiting,
++            )
++            if warmed is not NO_SPAN_GAPS:
++                return warmed
 +        if state is None and did_prefix_lookup:
 +            probed = _schedule_spanfuse_probe(
 +                sched,
@@ -4859,6 +5354,163 @@ index 0000000000..d19631907b
 +    return token_budget - gap_overhead
 +
 +
++def _schedule_spanfuse_otf_warm(
++    sched: "Scheduler",
++    request: "Request",
++    num_computed_tokens: int,
++    num_external_computed_tokens: int,
++    num_new_local_computed_tokens: int,
++    new_computed_blocks,
++    token_budget: int,
++    num_scheduled_tokens: dict[str, int],
++    virtual_reqs_out: list[NewRequestData],
++    virtual_gap_req_ids: set[str],
++    request_queue,
++    step_skipped_waiting,
++):
++    """Encode the cold spans of the uncached tail span-locally and cache them
++    under their plain keys, then look the prefix up again ("otf" state), so the
++    probe and repair see them as warmed hits exactly as a separate warm-up would."""
++    request.spanfuse_otf_warmed = True
++    bs = sched.block_size
++    spans = [
++        (s, e // bs * bs)
++        for s, e in QCFusePolicy._span_ranges(request, request.num_tokens)
++        if s >= num_computed_tokens and s % bs == 0 and e // bs * bs > s
++    ]
++    if not spans or num_external_computed_tokens:
++        return NO_SPAN_GAPS
++    sources = request.prefix_hit_sources or []
++    end = spans[-1][1]
++    pol = sched.gap_policy
++    seed = request.spanfuse_seed
++    # every earlier span was repaired under this prefix, so an in-context encode reads exact KV
++    prefix_exact = all(
++        sources[b] == PrefixHitSource.PD
++        for s, e in QCFusePolicy._span_ranges(request, num_computed_tokens)
++        for b in range(s // bs, min(cdiv(e, bs), len(sources)))
++    )
++    # whole span: encode every cold span in context now and cache it under the pd key,
++    # or, as a seed, under the plain key so later contexts start from this copy, not the blind one
++    if (
++        (seed or all(pol._budget(request, s, e) >= e - s for s, e in spans))
++        and request.pd_block_hashes is not None
++        and len(sources) >= num_computed_tokens // bs
++        and PrefixHitSource.MISS not in sources
++        and (seed or prefix_exact)
++        and len(request.pd_block_hashes) >= end // bs
++        and end - num_computed_tokens <= sched.max_num_scheduled_tokens
++    ):
++        work = end - num_computed_tokens
++        if work > token_budget:
++            request.spanfuse_otf_warmed = False
++            return None
++        blocks = sched.kv_cache_manager.allocate_slots(
++            request,
++            work,
++            num_new_computed_tokens=num_new_local_computed_tokens,
++            new_computed_blocks=new_computed_blocks,
++            delay_cache_blocks=True,
++        )
++        if blocks is None:
++            request.spanfuse_otf_warmed = False
++            return None
++        manager = sched.kv_cache_manager.coordinator.single_type_managers[0]
++        req_blocks = manager.req_to_blocks[request.request_id]
++        first = min(request.span_starts)
++        idx = range(num_computed_tokens // bs, end // bs)
++        sched.kv_cache_manager.block_pool.cache_blocks_under_hashes(
++            [req_blocks[b] for b in idx],
++            [
++                request.pd_block_hashes[b]
++                if b * bs >= first and not seed
++                else request.block_hashes[b]
++                for b in idx
++            ],
++            0,
++        )
++        if seed and prefix_exact:
++            # a block hash shared by two spans here resolves to the first one's copy
++            n = Counter(request.block_hashes[b] for b in idx)
++            request.spanfuse_seeded = {
++                s
++                for s, e in spans
++                if all(n[request.block_hashes[b]] == 1 for b in range(s // bs, e // bs))
++            }
++        logger.info(
++            "SpanFuse: %d cold spans (%d tokens) encoded in context in %s%s",
++            len(spans),
++            work,
++            request.request_id,
++            " (seed)" if seed else "",
++        )
++        request.num_computed_tokens = num_computed_tokens
++        parent_nrd = NewRequestData.from_request(
++            request, sched.kv_cache_manager.get_blocks(request.request_id).get_block_ids()
++        )
++        append_virtual_gap_reqs(
++            parent_nrd,
++            [(num_computed_tokens, end)],
++            virtual_reqs_out,
++            virtual_gap_req_ids,
++            num_scheduled_tokens,
++        )
++        request.spanfuse_state = "otf"
++        request_queue.pop_request()
++        step_skipped_waiting.prepend_request(request)
++        return token_budget - work
++    work = sum(e - s for s, e in spans)
++    if work > sched.max_num_scheduled_tokens:
++        logger.warning(
++            "SpanFuse: on-the-fly warm-up of %d tokens too large for %s",
++            work,
++            request.request_id,
++        )
++        return NO_SPAN_GAPS
++    if work > token_budget:
++        request.spanfuse_otf_warmed = False
++        return None
++    # nothing is cached here but the span blocks: the crosses would read blind spans
++    blocks = sched.kv_cache_manager.allocate_slots(
++        request,
++        spans[-1][1] - num_computed_tokens,
++        num_new_computed_tokens=num_new_local_computed_tokens,
++        new_computed_blocks=new_computed_blocks,
++        delay_cache_blocks=True,
++    )
++    if blocks is None:
++        request.spanfuse_otf_warmed = False
++        return None
++    manager = sched.kv_cache_manager.coordinator.single_type_managers[0]
++    req_blocks = manager.req_to_blocks[request.request_id]
++    idx = [b for s, e in spans for b in range(s // bs, e // bs)]
++    sched.kv_cache_manager.block_pool.cache_blocks_under_hashes(
++        [req_blocks[b] for b in idx], [request.block_hashes[b] for b in idx], 0
++    )
++    logger.info(
++        "SpanFuse: %d cold spans (%d tokens) warmed on the fly in %s%s",
++        len(spans),
++        work,
++        request.request_id,
++        " (seed fell back to blind)" if seed else "",
++    )
++    request.num_computed_tokens = num_computed_tokens
++    parent_nrd = NewRequestData.from_request(
++        request, sched.kv_cache_manager.get_blocks(request.request_id).get_block_ids()
++    )
++    n0 = len(virtual_reqs_out)
++    append_virtual_gap_reqs(
++        parent_nrd, spans, virtual_reqs_out, virtual_gap_req_ids, num_scheduled_tokens
++    )
++    for nrd in virtual_reqs_out[n0:]:
++        nrd.is_gap_recompute = False  # span-local, as the plain key promises
++    # the scheduler frees the blocks and runs a fresh lookup on the next step
++    request.spanfuse_state = "otf"
++    request_queue.pop_request()
++    step_skipped_waiting.prepend_request(request)
++    return token_budget - work
++
++
 +def _schedule_spanfuse_probe(
 +    sched: "Scheduler",
 +    request: "Request",
@@ -4878,15 +5530,76 @@ index 0000000000..d19631907b
 +    the probe never reads the null placeholder, and again with the repair."""
 +    bs = sched.block_size
 +    sources = request.prefix_hit_sources or []
++    ranges = QCFusePolicy._span_ranges(request, num_computed_tokens)
++    # a pd hit means this exact prefix already repaired the span: reuse it as cached
++    request.spanfuse_settled = {
++        s
++        for s, e in ranges
++        if any(
++            sources[b] == PrefixHitSource.PD
++            for b in range(s // bs, min(e // bs, len(sources)))
++        )
++    }
++    # the probe scores warmed spans only: a span with a MISS block is recomputed whole
++    cold = [
++        (s, e)
++        for s, e in ranges
++        if s not in request.spanfuse_settled
++        and any(
++            sources[b] == PrefixHitSource.MISS
++            for b in range(s // bs, min(cdiv(e, bs), len(sources)))
++        )
++    ]
++    if cold:
++        logger.info(
++            "SpanFuse: %d of %d spans unwarmed in %s, recomputed in context",
++            len(cold),
++            len(ranges),
++            request.request_id,
++        )
++    # a seed is this request's own in-context copy: repairing it would recompute the same KV
++    request.spanfuse_settled |= {s for s, _ in cold} | request.spanfuse_seeded
++    request.spanfuse_miss_gaps = cold
 +    span_blocks = [
 +        b
-+        for s, e in QCFusePolicy._span_ranges(request, num_computed_tokens)
++        for s, e in ranges
++        if s not in request.spanfuse_settled
 +        for b in range(s // bs, e // bs)
 +    ]
 +    if not any(
 +        b < len(sources) and sources[b] == PrefixHitSource.PIC for b in span_blocks
 +    ):
 +        return NO_SPAN_GAPS
++    budgets = [
++        (sched.gap_policy._budget(request, s, e), e - s)
++        for s, e in ranges
++        if s not in request.spanfuse_settled
++    ]
++    # whole span or zero budget: importance cannot change the selection, so skip the scoring pass
++    if all(b >= n for b, n in budgets) or all(b <= 0 for b, _ in budgets):
++        request.qcfuse_importance = [0.0] * num_computed_tokens
++        return NO_SPAN_GAPS
++    qids = [
++        int(x)
++        for x in envs.VLLM_V1_SPANS_QCFUSE_QUERY_TOKEN_IDS.replace("\\", "").split(",")
++        if x.strip()
++    ]
++    if request.spanfuse_query_starts and qids:
++        return _schedule_spanfuse_span_probes(
++            sched,
++            request,
++            qids,
++            num_computed_tokens,
++            num_external_computed_tokens,
++            num_new_local_computed_tokens,
++            new_computed_blocks,
++            token_budget,
++            num_scheduled_tokens,
++            virtual_reqs_out,
++            virtual_gap_req_ids,
++            request_queue,
++            step_skipped_waiting,
++        )
 +    tail = request.num_tokens - num_computed_tokens
 +    # the appended instruction rows are the query, so no cached window is re-run
 +    suffix = spanfuse_query_ids(sched.vllm_config.model_config)
@@ -4896,7 +5609,7 @@ index 0000000000..d19631907b
 +    w = max(0, request.num_tokens - QCFUSE_MAX_QUERY_TOKENS) // bs * bs
 +    w = num_computed_tokens if suffix else min(num_computed_tokens, w)
 +    window = num_computed_tokens - w
-+    miss = sched._merge_gaps(miss_gaps(request, bs))
++    miss = sched._merge_gaps(miss_gaps(request, bs) + request.spanfuse_miss_gaps)
 +    work = tail + window + len(suffix) + sum(e - s for s, e in miss)
 +    if work > sched.max_num_scheduled_tokens:
 +        # ponytail: oversized probe falls back to span-head repair; chunk if it fires
@@ -4953,6 +5666,140 @@ index 0000000000..d19631907b
 +    num_scheduled_tokens[probe.req_id] = tail + window + len(suffix)
 +    virtual_reqs_out.append(probe)
 +    virtual_gap_req_ids.add(probe.req_id)
++    request.spanfuse_state = "inflight"
++    request_queue.pop_request()
++    step_skipped_waiting.prepend_request(request)
++    return token_budget - work
++
++
++def _schedule_spanfuse_span_probes(
++    sched: "Scheduler",
++    request: "Request",
++    qids: list[int],
++    num_computed_tokens: int,
++    num_external_computed_tokens: int,
++    num_new_local_computed_tokens: int,
++    new_computed_blocks,
++    token_budget: int,
++    num_scheduled_tokens: dict[str, int],
++    virtual_reqs_out: list[NewRequestData],
++    virtual_gap_req_ids: set[str],
++    request_queue,
++    step_skipped_waiting,
++):
++    """One probe row per re-read span: the mw sentence spliced at that span's
++    tail reads the whole prefix and scores only that span's blocks."""
++    bs, nq = sched.block_size, len(qids)
++    sources = request.prefix_hit_sources or []
++    toks = request.prompt_token_ids or []
++    # stripped: the mw sent only the block-aligned start; the sentence lives in scratch
++    stripped = request.spanfuse_query_stripped
++    probes = []
++    for s, e in QCFusePolicy._span_ranges(request, num_computed_tokens):
++        if s in request.spanfuse_settled or not any(
++            sources[b] == PrefixHitSource.PIC
++            for b in range(s // bs, min(e // bs, len(sources)))
++        ):
++            continue
++        qs = next(
++            (
++                q
++                for q in request.spanfuse_query_starts or ()
++                # stripped: the start is the span's block-aligned end
++                if ((s < q <= e and not q % bs) if stripped else s <= q < e)
++                and q + (0 if stripped else nq) <= num_computed_tokens
++            ),
++            None,
++        )
++        if qs is None:
++            continue
++        if not stripped and list(toks[qs : qs + nq]) != qids:
++            logger.warning(
++                "SpanFuse: sentence ids differ at %d in %s", qs, request.request_id
++            )
++            continue
++        probes.append((qs, list(range(s // bs, qs // bs)), s))
++    if not probes:
++        return NO_SPAN_GAPS
++    miss = sched._merge_gaps(miss_gaps(request, bs) + request.spanfuse_miss_gaps)
++    # every probe is a batch row; the input batch holds max_num_running_reqs
++    free = (
++        sched.max_num_running_reqs
++        - len(sched.running)
++        - len(virtual_reqs_out)
++        - len(miss)
++    )
++    if free < 1:
++        return None
++    f, nqb = cdiv(request.num_tokens, bs), cdiv(nq, bs)
++    if stripped:
++        # each probe writes its sentence KV to its own scratch blocks past the prompt
++        free = min(free, (cdiv(sched.max_model_len, bs) - f) // nqb)
++        if free < 1:
++            return NO_SPAN_GAPS
++    probes = probes[-free:]  # ponytail: newest spans win when rows run out
++    work = nq * len(probes) + sum(e - s for s, e in miss)
++    if work > token_budget:
++        return None
++    tail = request.num_tokens - num_computed_tokens
++    scratch = (f + nqb * len(probes)) * bs - request.num_tokens if stripped else 0
++    blocks = sched.kv_cache_manager.allocate_slots(
++        request,
++        tail,
++        num_new_computed_tokens=num_new_local_computed_tokens,
++        new_computed_blocks=new_computed_blocks,
++        num_external_computed_tokens=num_external_computed_tokens,
++        num_lookahead_tokens=scratch,
++        delay_cache_blocks=True,
++        span_gaps=miss,
++    )
++    if blocks is None:
++        return None
++    request.prefix_hit_sources = [
++        PrefixHitSource.PD if s == PrefixHitSource.MISS else s for s in sources
++    ]
++    request.spanfuse_miss_gaps = miss
++    request.num_computed_tokens = num_computed_tokens
++    parent_nrd = NewRequestData.from_request(
++        request, sched.kv_cache_manager.get_blocks(request.request_id).get_block_ids()
++    )
++    if miss:
++        append_virtual_gap_reqs(
++            parent_nrd,
++            miss,
++            virtual_reqs_out,
++            virtual_gap_req_ids,
++            num_scheduled_tokens,
++        )
++    for j, (qs, span_blocks, s) in enumerate(probes):
++        # the sentence is cached: window = all its rows, so no KV is rewritten
++        probe = replace(
++            parent_nrd,
++            req_id=f"{request.request_id}.probe{j}",
++            parent_req_id=request.request_id,
++            num_computed_tokens=qs,
++            is_spanfuse_probe=True,
++            spanfuse_span_blocks=span_blocks,
++            spanfuse_window=nq,
++            spanfuse_query_rows=nq,
++        )
++        if stripped:
++            lo = f + j * nqb
++            probe = replace(
++                probe,
++                block_ids=tuple(
++                    g[: qs // bs] + g[lo : lo + nqb] for g in parent_nrd.block_ids
++                ),
++                prompt_token_ids=list(toks[:qs]) + qids,
++                spanfuse_window=0,
++                spanfuse_probe_lb=s,
++            )
++        num_scheduled_tokens[probe.req_id] = nq
++        virtual_reqs_out.append(probe)
++        virtual_gap_req_ids.add(probe.req_id)
++    logger.info(
++        "SpanFuse per-span probe %s: %d sentences", request.request_id, len(probes)
++    )
 +    request.spanfuse_state = "inflight"
 +    request_queue.pop_request()
 +    step_skipped_waiting.prepend_request(request)
@@ -5158,13 +6005,10 @@ index 0000000000..d19631907b
 +        # ValueError, since create_policy() swallows TypeError into NoGapPolicy
 +        if not parse_critical_layers():
 +            raise ValueError("QCFuse needs VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS")
-+        if not 0.0 < rho <= 1.0 or granularity not in ("block", "token"):
++        if not 0.0 <= rho <= 1.0 or granularity not in ("block", "token"):
 +            raise ValueError(f"QCFuse: bad rho={rho} or granularity={granularity}")
 +        if k_per_span < 0:
 +            raise ValueError(f"QCFuse: k_per_span must be >= 0, got {k_per_span}")
-+        # without prerotate the span head carries a positional error QCFuse ignores
-+        if not envs.VLLM_V1_SPANS_PREROTATE:
-+            raise ValueError("QCFuse requires VLLM_V1_SPANS_PREROTATE=True")
 +        self.rho = rho
 +        self.block_size = block_size
 +        self.granularity = granularity
@@ -5185,6 +6029,13 @@ index 0000000000..d19631907b
 +            "%s: %d gaps for %s", type(self).__name__, len(gaps), request.request_id
 +        )
 +        return gaps
++
++    def _budget(self, request: "Request", start: int, end: int) -> int:
++        """Tokens to repair in span [start, end): the request's share, else the server's."""
++        rho = getattr(request, "spanfuse_rho", None)
++        if rho is not None:
++            return int(rho * (end - start))
++        return self.k_per_span or int(self.rho * (end - start))
 +
 +    @staticmethod
 +    def _span_ranges(
@@ -5211,7 +6062,7 @@ index 0000000000..d19631907b
 +        # TopK inside each span: prefix blocks are already exact
 +        bs, gaps = self.block_size, []
 +        for start, end in self._span_ranges(request, n):
-+            budget = self.k_per_span or int(self.rho * (end - start))
++            budget = self._budget(request, start, end)
 +            if budget <= 0:
 +                continue
 +            if self.granularity == "token":
@@ -5311,26 +6162,44 @@ index 0000000000..d19631907b
 +class SpanFusePolicy(QCFusePolicy):
 +    """QCFuse whose importance comes from the current request's probe."""
 +
-+    # every span keeps its head block repaired; the scoring pass ranks the rest
-+    anchor_blocks = 1
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        # every span keeps its first N blocks repaired; the scoring pass ranks the rest
++        self.anchor_blocks = envs.VLLM_V1_SPANS_SPANFUSE_ANCHOR_BLOCKS
++        if self.anchor_blocks < 0:
++            raise ValueError(f"SpanFuse: anchor_blocks must be >= 0, got {self.anchor_blocks}")
++        logger.info(
++            "SpanFusePolicy initialized: k_per_span=%d rho=%s anchor_blocks=%d",
++            self.k_per_span, self.rho, self.anchor_blocks,
++        )
 +
 +    def _select(
 +        self, request: "Request", importance: list[float], n: int
 +    ) -> list[tuple[int, int]]:
++        settled = request.spanfuse_settled
 +        if self.granularity == "token":
-+            return super()._select(request, importance, n)
++            gaps = super()._select(request, importance, n)
++            return [
++                g
++                for g in gaps
++                if not any(s <= g[0] < e for s, e in self._span_ranges(request, n) if s in settled)
++            ]
 +        bs, gaps = self.block_size, []
++        toks, pad = request.prompt_token_ids, envs.VLLM_V1_SPANS_PAD_TOKEN
++
++        # pad rows carry no content, so they never vote for a block
++        def mass(b: int) -> float:
++            r = range(b * bs, (b + 1) * bs)
++            return sum(importance[i] for i in r if toks[i] != pad)
++
 +        for start, end in self._span_ranges(request, n):
-+            budget = self.k_per_span or int(self.rho * (end - start))
-+            if budget <= 0:
++            budget = self._budget(request, start, end)
++            if budget <= 0 or start in settled:
 +                continue
 +            k = max(1, budget // bs)
 +            blocks = list(range(start // bs, min(end // bs, len(importance) // bs)))
 +            head = blocks[: min(self.anchor_blocks, k)]
-+            rest = sorted(
-+                blocks[len(head) :],
-+                key=lambda b: -sum(importance[b * bs : (b + 1) * bs]),
-+            )
++            rest = sorted(blocks[len(head) :], key=lambda b: -mass(b))
 +            top = head + rest[: k - len(head)]
 +            gaps += [(b * bs, (b + 1) * bs) for b in sorted(top)]
 +        return gaps
@@ -5404,10 +6273,10 @@ index 0000000000..d19631907b
 +        cls._POLICIES[name.lower()] = policy_class
 +        logger.info("Registered gap policy: %s -> %s", name, policy_class.__name__)
 diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
-index 0c1b9d34c5..da9b9a9448 100644
+index 0c1b9d34c5..6b0d67538b 100644
 --- a/vllm/v1/core/sched/output.py
 +++ b/vllm/v1/core/sched/output.py
-@@ -43,6 +43,18 @@ class NewRequestData:
+@@ -43,6 +43,19 @@ class NewRequestData:
      # Only used for v2 model runner.
      prefill_token_ids: list[int] | None = None
  
@@ -5422,11 +6291,12 @@ index 0c1b9d34c5..da9b9a9448 100644
 +    spanfuse_span_blocks: list[int] | None = None
 +    spanfuse_window: int = 0  # leading probe rows that are already cached
 +    spanfuse_query_rows: int = 0  # appended instruction rows, 0 = prompt tail
++    spanfuse_probe_lb: int = -1  # stripped sentence: its span start, -1 = none
 +
      @classmethod
      def from_request(
          cls,
-@@ -235,6 +247,10 @@ class SchedulerOutput:
+@@ -235,10 +248,16 @@ class SchedulerOutput:
      # EC Cache Connector metadata
      ec_connector_metadata: ECConnectorMetadata | None = None
  
@@ -5437,6 +6307,12 @@ index 0c1b9d34c5..da9b9a9448 100644
      # Block IDs freshly allocated from the pool during this scheduling step.
      # The worker zeros the corresponding GPU memory before the blocks are used,
      # preventing stale NaN/data from corrupting attention or SSM computation.
+     new_block_ids_to_zero: list[int] | None = None
++    # SPANSHIFT: (req, span_starts, block idx, blind ids, fresh ids) per gap swap
++    spanshift_pairs: list[tuple] | None = None
+ 
+     # Dynamic speculative decoding: optimal K chosen by scheduler.
+     # Number of spec tokens to schedule for the next step.
 diff --git a/vllm/v1/core/sched/qcfuse_store.py b/vllm/v1/core/sched/qcfuse_store.py
 new file mode 100644
 index 0000000000..38c028d97e
@@ -5486,7 +6362,7 @@ index 0000000000..38c028d97e
 +        # all-unmeasured selects like a partial hit (span head), not zero repair
 +        return out
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 4d94d14905..2ce5604b6e 100644
+index 4d94d14905..0461857a62 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -38,6 +38,15 @@ from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
@@ -5541,7 +6417,19 @@ index 4d94d14905..2ce5604b6e 100644
          self.kv_event_publisher = EventPublisherFactory.create(
              self.kv_events_config,
              self.parallel_config.data_parallel_index,
-@@ -400,6 +431,8 @@ class Scheduler(SchedulerInterface):
+@@ -382,6 +413,11 @@ class Scheduler(SchedulerInterface):
+ 
+     def schedule(self) -> SchedulerOutput:
+         self.current_step += 1
++        # SPANSHIFT: the last step's blind copies have been read by now
++        kvm = self.kv_cache_manager
++        if kvm.spanshift_held:
++            kvm.block_pool.free_blocks(kvm.spanshift_held)
++            kvm.spanshift_held = []
+         # NOTE(woosuk) on the scheduling algorithm:
+         # There's no "decoding phase" nor "prefill phase" in the scheduler.
+         # Each request just has the num_computed_tokens and
+@@ -400,6 +436,8 @@ class Scheduler(SchedulerInterface):
  
          req_to_new_blocks: dict[str, KVCacheBlocks] = {}
          num_scheduled_tokens: dict[str, int] = {}
@@ -5550,9 +6438,16 @@ index 4d94d14905..2ce5604b6e 100644
          token_budget = self.max_num_scheduled_tokens
          if self._pause_state == PauseState.PAUSED_ALL:
              # Do not schedule any requests when paused.
-@@ -653,7 +686,8 @@ class Scheduler(SchedulerInterface):
+@@ -652,8 +690,15 @@ class Scheduler(SchedulerInterface):
+                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                  num_uncached_common_prefix_tokens = 0
  
++                if request.spanfuse_state == "otf":
++                    # SPANFUSE: the cold spans are cached now, so look the prefix up again
++                    self.kv_cache_manager.free(request)
++                    request.num_computed_tokens = 0
++                    request.spanfuse_state = None
++                    request.span_gaps_selection = None
                  # Get already-cached tokens.
 -                if request.num_computed_tokens == 0:
 +                did_prefix_lookup = request.num_computed_tokens == 0
@@ -5560,7 +6455,7 @@ index 4d94d14905..2ce5604b6e 100644
                      # Get locally-cached tokens.
                      if (
                          self.connector is not None
-@@ -748,7 +782,10 @@ class Scheduler(SchedulerInterface):
+@@ -748,7 +793,10 @@ class Scheduler(SchedulerInterface):
                          assert num_computed_tokens <= request.num_prompt_tokens
                          request.prefill_stats.set(
                              num_prompt_tokens=request.num_prompt_tokens,
@@ -5572,7 +6467,7 @@ index 4d94d14905..2ce5604b6e 100644
                              num_external_cached_tokens=num_external_computed_tokens,
                          )
                  else:
-@@ -757,10 +794,17 @@ class Scheduler(SchedulerInterface):
+@@ -757,10 +805,17 @@ class Scheduler(SchedulerInterface):
                      new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                      num_new_local_computed_tokens = 0
                      num_computed_tokens = request.num_computed_tokens
@@ -5590,7 +6485,7 @@ index 4d94d14905..2ce5604b6e 100644
  
                  if load_kv_async:
                      # KVTransfer: loading remote KV, do not allocate for new work.
-@@ -776,6 +820,39 @@ class Scheduler(SchedulerInterface):
+@@ -776,6 +831,39 @@ class Scheduler(SchedulerInterface):
                      if 0 < threshold < num_new_tokens:
                          num_new_tokens = threshold
  
@@ -5630,7 +6525,7 @@ index 4d94d14905..2ce5604b6e 100644
                      # chunked prefill has to be enabled explicitly to allow
                      # pooling requests to be chunked
                      if (
-@@ -787,6 +864,8 @@ class Scheduler(SchedulerInterface):
+@@ -787,6 +875,8 @@ class Scheduler(SchedulerInterface):
                          break
  
                      num_new_tokens = min(num_new_tokens, token_budget)
@@ -5639,7 +6534,7 @@ index 4d94d14905..2ce5604b6e 100644
                      assert num_new_tokens > 0
  
                      # Schedule encoder inputs.
-@@ -861,6 +940,7 @@ class Scheduler(SchedulerInterface):
+@@ -861,6 +951,7 @@ class Scheduler(SchedulerInterface):
                      full_sequence_must_fit=self.scheduler_reserve_full_isl,
                      reserved_blocks=reserved_blocks,
                      has_scheduled_reqs=bool(self.running),
@@ -5647,7 +6542,7 @@ index 4d94d14905..2ce5604b6e 100644
                  )
  
                  if new_blocks is None:
-@@ -1001,6 +1081,7 @@ class Scheduler(SchedulerInterface):
+@@ -1001,6 +1092,7 @@ class Scheduler(SchedulerInterface):
                  )
                  for req in scheduled_new_reqs
              ]
@@ -5655,15 +6550,20 @@ index 4d94d14905..2ce5604b6e 100644
  
          with record_function_or_nullcontext("schedule: make_cached_request_data"):
              cached_reqs_data = self._make_cached_request_data(
-@@ -1043,6 +1124,7 @@ class Scheduler(SchedulerInterface):
+@@ -1043,9 +1135,12 @@ class Scheduler(SchedulerInterface):
              # the previous and the current steps.
              finished_req_ids=self.finished_req_ids,
              free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
 +            virtual_gap_req_ids=virtual_gap_req_ids if virtual_gap_req_ids else None,
              new_block_ids_to_zero=new_block_ids_to_zero,
              num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
++            spanshift_pairs=kvm.spanshift_pairs or None,
          )
-@@ -1090,6 +1172,12 @@ class Scheduler(SchedulerInterface):
++        kvm.spanshift_pairs = []
+ 
+         # NOTE(Kuntai): this function is designed for multiple purposes:
+         # 1. Plan the KV cache store
+@@ -1090,6 +1185,14 @@ class Scheduler(SchedulerInterface):
          self._inflight_prefills.discard(request)
          request.status = RequestStatus.PREEMPTED
          request.num_computed_tokens = 0
@@ -5673,10 +6573,12 @@ index 4d94d14905..2ce5604b6e 100644
 +        if request.spanfuse_state is not None:
 +            request.spanfuse_state = request.qcfuse_importance = None
 +            request.spanfuse_miss_gaps = []
++        # the seed blocks may be evicted while preempted: re-seed or re-warm on resume
++        request.spanfuse_seeded, request.spanfuse_otf_warmed = set(), False
          if request.spec_token_ids:
              request.spec_token_ids = []
          request.num_preemptions += 1
-@@ -1111,7 +1199,9 @@ class Scheduler(SchedulerInterface):
+@@ -1111,7 +1214,9 @@ class Scheduler(SchedulerInterface):
          #    computed tokens will be adjusted in update_from_output.
          num_scheduled_tokens = scheduler_output.num_scheduled_tokens
          for req_id, num_scheduled_token in num_scheduled_tokens.items():
@@ -5687,7 +6589,7 @@ index 4d94d14905..2ce5604b6e 100644
              request.num_computed_tokens += num_scheduled_token
              if self.defer_block_free:
                  # Record the in-flight step, to fence deferred block freeing.
-@@ -1147,6 +1237,37 @@ class Scheduler(SchedulerInterface):
+@@ -1147,6 +1252,37 @@ class Scheduler(SchedulerInterface):
          # it will also affect the scheduler output.
          self.finished_req_ids = set()
  
@@ -5725,7 +6627,7 @@ index 4d94d14905..2ce5604b6e 100644
      def _update_request_as_session(
          self, session: Request, update: StreamingUpdate
      ) -> None:
-@@ -1471,6 +1592,31 @@ class Scheduler(SchedulerInterface):
+@@ -1471,6 +1607,40 @@ class Scheduler(SchedulerInterface):
                  num_scheduled_tokens,
              )
  
@@ -5741,23 +6643,32 @@ index 4d94d14905..2ce5604b6e 100644
 +        # SPANFUSE: the probe's importance feeds its own parent's repair
 +        if isinstance(self.gap_policy, SpanFusePolicy):
 +            imps = model_runner_output.qcfuse_importance or {}
++            summed: dict[str, list[float]] = {}
 +            for req_id in scheduler_output.num_scheduled_tokens:
-+                if not req_id.endswith(".probe"):
++                parent, sep, j = req_id.rpartition(".probe")
++                if not sep or not (j == "" or j.isdigit()):
 +                    continue
-+                req = self.requests.get(req_id[: -len(".probe")])
++                req = self.requests.get(parent)
 +                if req is None or req.spanfuse_state != "inflight":
 +                    continue
++                acc = summed.setdefault(parent, [])
 +                imp = imps.get(req_id)
 +                if imp is None:
 +                    logger.warning("SpanFuse: no probe importance for %s", req_id)
-+                    imp = [0.0] * req.num_computed_tokens
-+                req.qcfuse_importance = imp
++                    continue
++                # per-span probes score disjoint blocks, so their sum is the union
++                acc.extend([0.0] * (len(imp) - len(acc)))
++                for k, v in enumerate(imp):
++                    acc[k] += v
++            for parent, acc in summed.items():
++                req = self.requests[parent]
++                req.qcfuse_importance = acc or [0.0] * req.num_computed_tokens
 +                req.spanfuse_state = "measured"
 +
          # Persist per-step routed experts into the scheduler-side slot
          # buffer (CPU->CPU fancy-index assign; ~few MB per step).
          # MUST precede the per-request routing reads below: stopped
-@@ -1690,6 +1836,7 @@ class Scheduler(SchedulerInterface):
+@@ -1690,6 +1860,7 @@ class Scheduler(SchedulerInterface):
  
          if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
              requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
@@ -5766,22 +6677,29 @@ index 4d94d14905..2ce5604b6e 100644
              for request in requests:
                  outputs[request.client_index].append(
 diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
-index ad47e321e1..8367a297c4 100644
+index ad47e321e1..69ea07d54f 100644
 --- a/vllm/v1/core/single_type_kv_cache_manager.py
 +++ b/vllm/v1/core/single_type_kv_cache_manager.py
-@@ -597,6 +597,19 @@ class FullAttentionManager(SingleTypeKVCacheManager):
+@@ -597,6 +597,26 @@ class FullAttentionManager(SingleTypeKVCacheManager):
                  computed.pop()
          return computed_blocks
  
 +    def swap_blocks_for_gap_recompute(
-+        self, request_id: str, block_indices: Sequence[int]
++        self,
++        request_id: str,
++        block_indices: Sequence[int],
++        hold: list[KVCacheBlock] | None = None,
 +    ) -> list[KVCacheBlock]:
 +        """SPANS: replace PIC-hit blocks a gap recompute will fully rewrite
-+        with fresh blocks, releasing the shared blocks' refs."""
++        with fresh blocks, releasing the shared blocks' refs (into `hold`, when
++        given, so the worker can still read them this step)."""
 +        req_blocks = self.req_to_blocks[request_id]
 +        fresh_blocks = self.block_pool.get_new_blocks(len(block_indices))
 +        for idx, fresh in zip(block_indices, fresh_blocks):
-+            self.block_pool.free_blocks([req_blocks[idx]])
++            if hold is None:
++                self.block_pool.free_blocks([req_blocks[idx]])
++            else:
++                hold.append(req_blocks[idx])
 +            req_blocks[idx] = fresh
 +            self.new_block_ids.append(fresh.block_id)
 +        return fresh_blocks
@@ -5804,33 +6722,54 @@ index 9f13ad939f..9c6ed1393b 100644
      def with_kv_conn_output_only(
          kv_connector_output: KVConnectorOutput | None,
 diff --git a/vllm/v1/request.py b/vllm/v1/request.py
-index 0e8d4ee006..f55f1cfc82 100644
+index 0e8d4ee006..bd5a3634df 100644
 --- a/vllm/v1/request.py
 +++ b/vllm/v1/request.py
-@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
+@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Any
  
  import torch
  
 +from vllm import envs
++from vllm.logger import init_logger
  from vllm.multimodal.inputs import MultiModalFeatureSpec
  from vllm.pooling_params import PoolingParams
  from vllm.sampling_params import SamplingParams
-@@ -26,7 +27,7 @@ from vllm.v1.utils import ConstantList
+@@ -26,7 +28,23 @@ from vllm.v1.utils import ConstantList
  
  if TYPE_CHECKING:
      from vllm.lora.request import LoRARequest
 -    from vllm.v1.core.kv_cache_utils import BlockHash
 +    from vllm.v1.core.kv_cache_utils import BlockHash, PrefixHitSource
++
++logger = init_logger(__name__)
++
++
++def _parse_rho(value: Any) -> float | None:
++    """spans_repair_rho as a share in [0, 1]; anything else is ignored, not raised in the scheduler."""
++    if value is None:
++        return None
++    try:
++        rho = float(value)
++    except (TypeError, ValueError):
++        rho = float("nan")
++    if not 0.0 <= rho <= 1.0:
++        logger.warning("ignoring spans_repair_rho=%r: not a share in [0, 1]", value)
++        return None
++    return rho
  
  
  @dataclass
-@@ -101,6 +102,25 @@ class Request:
+@@ -101,6 +119,35 @@ class Request:
          # P/D: Connector-specific KV transfer parameters.
          self.kv_transfer_params: dict[str, Any] | None = None
  
 +        # SPANS: Per-request span boundary metadata
 +        self.span_starts: list[int] | None = None
 +        self.cross_span_starts: list[int] | None = None
++        self.spanfuse_query_starts: list[int] | None = None  # mw sentence after each span
++        self.spanfuse_query_stripped = False  # mw sent the starts, not the sentence
++        self.spanfuse_rho: float | None = None  # per-request share of span tokens to repair
++        self.spanfuse_seed = envs.VLLM_V1_SPANS_SPANFUSE_SEED  # cold spans seed the plain key
 +        # SPANS: pd sibling hashes (parallel to block_hashes), the token
 +        # ranges where the dual pd/pic lookup applies, and the per-block hit
 +        # sources of the latest dual lookup.
@@ -5846,11 +6785,17 @@ index 0e8d4ee006..f55f1cfc82 100644
 +        self.spanfuse_state: str | None = None
 +        # SPANFUSE: MISS ranges the probe filled blind; recomputed again with the repair
 +        self.spanfuse_miss_gaps: list[tuple[int, int]] = []
++        # SPANFUSE: span starts already repaired under this exact prefix (pd hit)
++        self.spanfuse_settled: set[int] = set()
++        # SPANFUSE: the cold tail spans were encoded on the fly, once per request
++        self.spanfuse_otf_warmed = False
++        # SPANFUSE: span starts this request encoded in context as the seed copy
++        self.spanfuse_seeded: set[int] = set()
 +
          if pooling_params is not None:
              # Pooling models.
              self.max_tokens = 1
-@@ -115,9 +135,27 @@ class Request:
+@@ -115,9 +162,39 @@ class Request:
                  self.kv_transfer_params = sampling_params.extra_args.get(
                      "kv_transfer_params"
                  )
@@ -5859,6 +6804,18 @@ index 0e8d4ee006..f55f1cfc82 100644
 +                    self.cross_span_starts = sampling_params.extra_args.get(
 +                        "cross_span_starts"
 +                    )
++                    self.spanfuse_query_starts = sampling_params.extra_args.get(
++                        "qcfuse_query_starts"
++                    )
++                    self.spanfuse_query_stripped = bool(
++                        sampling_params.extra_args.get("spanfuse_query_stripped")
++                    )
++                    self.spanfuse_rho = _parse_rho(
++                        sampling_params.extra_args.get("spans_repair_rho")
++                    )
++                    seed = sampling_params.extra_args.get("spans_seed")
++                    if seed is not None:
++                        self.spanfuse_seed = str(seed).lower() in ("true", "1")
          else:
              raise ValueError("sampling_params and pooling_params can't both be unset")
  
@@ -5878,7 +6835,7 @@ index 0e8d4ee006..f55f1cfc82 100644
          self.prompt_token_ids = prompt_token_ids
          self.prompt_embeds = prompt_embeds
          # Per-position mask used in mixed-mode (chat completion with
-@@ -151,6 +189,10 @@ class Request:
+@@ -151,6 +228,10 @@ class Request:
  
          self.spec_token_ids: list[int] = []
          self.num_computed_tokens = 0
@@ -5889,7 +6846,7 @@ index 0e8d4ee006..f55f1cfc82 100644
          self.cache_salt: str | None = cache_salt
  
          # Multi-modal related
-@@ -239,6 +281,11 @@ class Request:
+@@ -239,6 +320,11 @@ class Request:
          if self._block_hasher is not None:
              self.block_hashes.extend(self._block_hasher(self))
  
@@ -5943,10 +6900,10 @@ index 43007d9ccd..9895534141 100644
      finished_req_ids: set[str]
 +    virtual_gap_req_ids: set[str] | None
 diff --git a/vllm/v1/worker/gpu_input_batch.py b/vllm/v1/worker/gpu_input_batch.py
-index 89d69c0bde..52856f78b3 100644
+index 89d69c0bde..ba212a025a 100644
 --- a/vllm/v1/worker/gpu_input_batch.py
 +++ b/vllm/v1/worker/gpu_input_batch.py
-@@ -56,6 +56,12 @@ class CachedRequestState:
+@@ -56,6 +56,13 @@ class CachedRequestState:
      # prompt_embeds content parts). See `Request.prompt_is_token_ids`.
      prompt_is_token_ids: list[bool] | None = None
  
@@ -5955,16 +6912,21 @@ index 89d69c0bde..52856f78b3 100644
 +    spanfuse_span_blocks: list[int] | None = None
 +    spanfuse_window: int = 0  # leading probe rows that are already cached
 +    spanfuse_query_rows: int = 0
++    spanfuse_probe_lb: int = -1
 +
      # Used when both async_scheduling and spec_decode are enabled.
      prev_num_draft_len: int = 0
  
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index b958ef79d0..10e03c078a 100644
+index b958ef79d0..3081099057 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
-@@ -3,7 +3,9 @@
+@@ -1,9 +1,13 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
  
++import bisect
++import collections
  import functools
  import gc
 +import hashlib
@@ -5973,7 +6935,7 @@ index b958ef79d0..10e03c078a 100644
  import threading
  import time
  from collections import defaultdict
-@@ -11,6 +13,7 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
+@@ -11,6 +15,7 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
  from contextlib import contextmanager
  from copy import copy, deepcopy
  from dataclasses import dataclass, replace
@@ -5981,7 +6943,7 @@ index b958ef79d0..10e03c078a 100644
  from functools import reduce
  from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
  
-@@ -92,6 +95,7 @@ from vllm.model_executor.models.interfaces_base import (
+@@ -92,6 +97,7 @@ from vllm.model_executor.models.interfaces_base import (
      is_pooling_model,
      is_text_generation_model,
  )
@@ -5989,7 +6951,7 @@ index b958ef79d0..10e03c078a 100644
  from vllm.model_executor.offloader import (
      create_offloader,
      get_offloader,
-@@ -121,6 +125,7 @@ from vllm.utils.torch_utils import (
+@@ -121,6 +127,7 @@ from vllm.utils.torch_utils import (
      is_quantized_kv_cache,
      kv_cache_dtype_str_to_dtype,
  )
@@ -5997,7 +6959,7 @@ index b958ef79d0..10e03c078a 100644
  from vllm.v1.attention.backend import (
      AttentionBackend,
      AttentionCGSupport,
-@@ -133,6 +138,7 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
+@@ -133,10 +140,15 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
  from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
  from vllm.v1.attention.backends.utils import (
      NULL_BLOCK_ID,
@@ -6005,7 +6967,15 @@ index b958ef79d0..10e03c078a 100644
      create_fast_prefill_custom_backend,
      get_dcp_local_seq_lens,
      reorder_batch_to_split_decodes_and_prefills,
-@@ -235,6 +241,24 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
+ )
++from vllm.v1.attention.ops.triton_unified_attention import (
++    SPANS_FULLQ,
++    SPANS_LB_MASK,
++)
+ from vllm.v1.core.sched.output import NewRequestData
+ from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+ from vllm.v1.kv_cache_interface import (
+@@ -235,6 +247,24 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
  PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
  
  
@@ -6030,7 +7000,7 @@ index b958ef79d0..10e03c078a 100644
  # Wrapper for ModelRunnerOutput to support overlapped execution.
  class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
      def __init__(
-@@ -415,6 +439,28 @@ class ExecuteModelState(NamedTuple):
+@@ -415,6 +445,80 @@ class ExecuteModelState(NamedTuple):
      slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
  
  
@@ -6038,6 +7008,7 @@ index b958ef79d0..10e03c078a 100644
 +    span_starts: list[int],
 +    cross_span_starts: list[int] | None,
 +    req_len: int,
++    clip: bool = True,
 +) -> list[tuple[int, int, int]]:
 +    """SPANS: (start, end, lb) attention-lower-bound regions for a request.
 +
@@ -6045,21 +7016,72 @@ index b958ef79d0..10e03c078a 100644
 +    start (adjacent spans carry no cross of their own - the client skips
 +    crosses that coincide with a span start) or the first cross past it.
 +    Index-pairing crosses to spans paints lb wrongly over later spans and the
-+    generated tail whenever spans are adjacent."""
++    generated tail whenever spans are adjacent. Regions are clipped to
++    req_len: a chunk, probe or virtual request shorter than the prompt would
++    otherwise write lb words into the next request's packed slice, masking
++    every key of its rows (0/0 = NaN, sampled as token 0 = gemma <pad>)."""
 +    crosses = sorted(cross_span_starts or [])
 +    spans_sorted = sorted(span_starts)
 +    out = []
 +    for j, start in enumerate(spans_sorted):
++        if clip and start >= req_len:  # past this chunk: would paint the NEXT request
++            break
 +        nxt = spans_sorted[j + 1] if j + 1 < len(spans_sorted) else req_len
 +        cross = next((c for c in crosses if c > start), req_len)
-+        out.append((start, min(nxt, cross), start))
++        end = min(nxt, cross)
++        out.append((start, min(end, req_len) if clip else end, start))
 +    return out
++
++
++def _spill_source(req, req_len: int) -> str:
++    """SPANS: which kind of short request overflows its lb slot."""
++    if req.is_spanfuse_probe:
++        return "probe"
++    if req.is_gap_recompute:
++        return "gap"
++    if req_len < req.num_prompt_tokens:
++        return "chunk"
++    return "other"
++
++
++def _span_lb_geom(req) -> tuple | None:
++    """SPANS: (sorted starts, unclipped ends, gap flag, first raw-K start) or None."""
++    sp = req.sampling_params
++    ea = sp.extra_args if sp is not None else None
++    spans = ea.get("span_starts") if ea else None
++    if not spans:
++        return None
++    starts = sorted(spans)
++    crosses = sorted(ea.get("cross_span_starts") or [])
++    inf = 1 << 62
++    ends = []
++    for j, s in enumerate(starts):
++        k = bisect.bisect_right(crosses, s)
++        nxt = starts[j + 1] if j + 1 < len(starts) else inf
++        ends.append(min(nxt, crosses[k] if k < len(crosses) else inf))
++    raw = next((s for s, e in zip(starts, ends) if 0 < s < e), inf)
++    return starts, ends, SPANS_FULLQ if req.is_gap_recompute else 0, raw
++
++
++def _paint_span_lb(geom, a: int, b: int, out: np.ndarray, off: int) -> bool:
++    """SPANS: paint lb of [a, b) into out at off; False (untouched) if all zero."""
++    starts, ends, full, _ = geom
++    j, wrote = max(bisect.bisect_right(starts, a) - 1, 0), False
++    while j < len(starts) and starts[j] < b:
++        lo, hi = max(starts[j], a), min(ends[j], b)
++        if hi > lo and starts[j] | full:
++            if not wrote:
++                out[off + a : off + b] = 0
++                wrote = True
++            out[off + lo : off + hi] = starts[j] | full
++        j += 1
++    return wrote
 +
 +
  class GPUModelRunner(
      LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
  ):
-@@ -534,6 +580,32 @@ class GPUModelRunner(
+@@ -534,6 +638,32 @@ class GPUModelRunner(
          self.encoder_cache: dict[str, torch.Tensor] = {}
          self.late_interaction_runner = LateInteractionRunner()
  
@@ -6092,7 +7114,7 @@ index b958ef79d0..10e03c078a 100644
          # Encoder CUDA graph manager (initialized after model load if enabled)
          self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
  
-@@ -721,6 +793,49 @@ class GPUModelRunner(
+@@ -721,6 +851,53 @@ class GPUModelRunner(
          self.positions = torch.zeros(
              self.max_num_tokens, dtype=torch.int64, device=self.device
          )
@@ -6131,6 +7153,10 @@ index b958ef79d0..10e03c078a 100644
 +                )
 +                # per-slot live length, to clear stale tails on slot reuse
 +                self._spans_lb_len = [0] * self.max_num_reqs
++                # per row: owner, lb geometry, and whether it holds nonzero words
++                self._spans_lb_owner: list = [None] * self.max_num_reqs
++                self._spans_lb_geom: list = [None] * self.max_num_reqs
++                self._spans_lb_dirty = [False] * self.max_num_reqs
 +        # QCFUSE: importance probe, allocated only under the knob
 +        self.qcfuse_capturer = None
 +        self._qcfuse_descs: list[tuple] = []
@@ -6142,7 +7168,7 @@ index b958ef79d0..10e03c078a 100644
          self.query_start_loc = self._make_buffer(
              self.max_num_reqs + 1, dtype=torch.int32
          )
-@@ -1234,6 +1349,13 @@ class GPUModelRunner(
+@@ -1234,6 +1411,14 @@ class GPUModelRunner(
                  num_computed_tokens=new_req_data.num_computed_tokens,
                  output_token_ids=[],
                  lora_request=new_req_data.lora_request,
@@ -6153,48 +7179,171 @@ index b958ef79d0..10e03c078a 100644
 +                ),
 +                spanfuse_window=getattr(new_req_data, "spanfuse_window", 0),
 +                spanfuse_query_rows=getattr(new_req_data, "spanfuse_query_rows", 0),
++                spanfuse_probe_lb=getattr(new_req_data, "spanfuse_probe_lb", -1),
              )
              self.requests[req_id] = req_state
              self.late_interaction_runner.register_request(req_id, pooling_params)
-@@ -1923,6 +2045,108 @@ class GPUModelRunner(
+@@ -1886,6 +2071,102 @@ class GPUModelRunner(
+ 
+         return encoder_seq_lens, encoder_seq_lens_cpu
+ 
++    def _log_lb_spill(
++        self, attn_lb, alt_lb, spill_src, req_kv_starts, num_computed,
++        seq_lens, noclip,
++    ) -> None:
++        """SPANS_LB_SPILL_LOG: count query rows that carry a foreign lb word."""
++        bad = alt_lb if not noclip else attn_lb  # the unclipped paint
++        good = attn_lb if not noclip else alt_lb
++        st = self.__dict__.setdefault("_lb_spill_stats", collections.Counter())
++        st["steps"] += 1
++        if not spill_src:
++            return
++        st["spill_steps"] += 1
++        ids = self.input_batch.req_ids
++        for i, src in spill_src:
++            st["spill_" + src] += 1
++        for j in range(len(ids)):
++            lo = int(req_kv_starts[j]) + int(num_computed[j])
++            hi = int(req_kv_starts[j]) + int(seq_lens[j])
++            diff = np.nonzero(bad[lo:hi] != good[lo:hi])[0]
++            if not len(diff):
++                continue
++            w = bad[lo:hi][diff]
++            pos = diff + int(num_computed[j])
++            lb = w & SPANS_LB_MASK
++            masked = int((((w & SPANS_FULLQ) == 0) & (lb > pos)).sum())
++            neg = int((lb > pos).sum())
++            st["victim_reqs"] += 1
++            st["victim_rows"] += len(diff)
++            st["masked_rows"] += masked
++            st["neg_pos_rows"] += neg
++            if st["logged"] < 50:
++                st["logged"] += 1
++                logger.warning(
++                    "SPANS_LB_SPILL victim=%s rows=%d masked=%d neg_pos=%d "
++                    "pos=%d..%d lb=%d..%d noclip=%s srcs=%s",
++                    ids[j], len(diff), masked, neg, int(pos[0]), int(pos[-1]),
++                    int(lb.min()), int(lb.max()), noclip,
++                    [(ids[i], s_) for i, s_ in spill_src if i < j],
++                )
++        if st["spill_steps"] % 100 == 1:
++            logger.warning("SPANS_LB_SPILL totals %s", dict(st))
++
++    def _spans_lb_fast(self, num_reqs: int, num_scheduled_tokens: np.ndarray) -> bool:
++        """SPANS: copy only lb positions new to a row; False if packed lb is needed."""
++        stride = self._spans_lb_stride
++        if (
++            not stride
++            or envs.VLLM_V1_SPANS_LB_SPILL_LOG
++            or envs.VLLM_V1_SPANS_LB_NOCLIP
++            or (
++                self.qcfuse_capturer is not None
++                and not envs.VLLM_V1_SPANS_SPANFUSE_ENABLE
++            )
++        ):
++            return False
++        ids = self.input_batch.req_ids
++        reqs = [self.requests[ids[i]] for i in range(num_reqs)]
++        if any(r.is_spanfuse_probe for r in reqs):
++            return False
++        seq_lens = (
++            self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
++        ).tolist()
++        lb_gpu, staging = self._attn_lower_bounds_gpu, self._spans_lb_staging
++        stg = staging.numpy()
++        owner, geom = self._spans_lb_owner, self._spans_lb_geom
++        lens, dirty = self._spans_lb_len, self._spans_lb_dirty
++        raw_k = False
++        for i, req in enumerate(reqs):
++            n, base, prev = min(seq_lens[i], stride), i * stride, lens[i]
++            fresh = owner[i] is not req
++            if fresh:
++                owner[i], geom[i] = req, _span_lb_geom(req)
++            g = geom[i]
++            lens[i] = n
++            if g is None:  # span-free: the row must read all zero
++                if fresh and dirty[i] and prev:
++                    lb_gpu[base : base + prev].zero_()
++                dirty[i] = False
++                continue
++            raw_k = raw_k or g[3] < seq_lens[i]
++            if prev > n:
++                lb_gpu[base + n : base + prev].zero_()
++            a, wrote = 0 if fresh else prev, False
++            if n > a:
++                wrote = _paint_span_lb(g, a, n, stg, base)
++                if wrote:
++                    lb_gpu[base + a : base + n].copy_(
++                        staging[base + a : base + n], non_blocking=True
++                    )
++                elif fresh and dirty[i]:
++                    lb_gpu[base : base + n].zero_()
++            dirty[i] = wrote or (dirty[i] and not fresh)
++        self._spans_no_raw_k = not raw_k
++        self._attn_lb_np = None
++        return True
++
+     def _prepare_inputs(
+         self,
+         scheduler_output: "SchedulerOutput",
+@@ -1923,6 +2204,131 @@ class GPUModelRunner(
              + self.query_pos.np[: cu_num_tokens[-1]]
          )
  
-+        if envs.VLLM_V1_SPANS_ENABLED:
++        if envs.VLLM_V1_SPANS_ENABLED and not self._spans_lb_fast(
++            num_reqs, num_scheduled_tokens
++        ):
 +            num_computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
 +            seq_lens_arr = num_computed + num_scheduled_tokens
 +            req_kv_starts = np.zeros(num_reqs + 1, dtype=np.int32)
 +            np.cumsum(seq_lens_arr, out=req_kv_starts[1:])
 +            attn_lb = np.zeros(int(req_kv_starts[-1]), dtype=np.int32)
-+            spans_prerotate_safe = True
++            noclip = envs.VLLM_V1_SPANS_LB_NOCLIP
++            spill_log = envs.VLLM_V1_SPANS_LB_SPILL_LOG
++            # SPILL_LOG paints both variants; ``attn_lb`` is the one that runs
++            alt_lb = np.zeros_like(attn_lb) if spill_log else None
++            spill_src: list[tuple[int, str]] = []
 +            for i in range(num_reqs):
 +                req = self.requests[self.input_batch.req_ids[i]]
 +                params = req.sampling_params
-+                if req.is_gap_recompute or params is None:
++                if params is None:
 +                    continue
 +                ea = params.extra_args
 +                spans = ea.get("span_starts") if ea else None
 +                if not spans or ea is None:
 +                    continue
 +                req_start, req_len = int(req_kv_starts[i]), int(seq_lens_arr[i])
-+                for start, end, lb in compute_span_lb_regions(
-+                    spans, ea.get("cross_span_starts"), req_len
++                # a gap recompute keeps span-local K but reads full context
++                full = SPANS_FULLQ if req.is_gap_recompute else 0
++                for arr, clip in ((attn_lb, not noclip), (alt_lb, noclip)):
++                    if arr is None:
++                        continue
++                    regions = compute_span_lb_regions(
++                        spans, ea.get("cross_span_starts"), req_len, clip
++                    )
++                    for start, end, lb in regions:
++                        arr[req_start + start : req_start + end] = lb | full
++                    if req.is_spanfuse_probe:
++                        # SPANFUSE: the query rows read the whole prefix
++                        q0 = req_start + int(num_computed[i])
++                        rows = slice(q0, req_start + req_len)
++                        if req.spanfuse_probe_lb >= 0:  # stripped: RoPE as in its span
++                            arr[rows] = req.spanfuse_probe_lb
++                        arr[rows] |= SPANS_FULLQ
++                if spill_log and any(
++                    e > req_len
++                    for _, e, _ in compute_span_lb_regions(
++                        spans, ea.get("cross_span_starts"), req_len, clip=False
++                    )
 +                ):
-+                    attn_lb[req_start + start : req_start + end] = lb
-+                q_start = req_start + int(num_computed[i])
-+                q_end = req_start + req_len
-+                if req.is_spanfuse_probe:
-+                    # SPANFUSE: the query rows read the whole prefix
-+                    attn_lb[q_start:q_end] = 0
-+                if q_end > q_start:
-+                    req_lbs = attn_lb[req_start:q_end]
-+                    query_lbs = attn_lb[q_start:q_end]
-+                    if np.max(req_lbs) > 0 and (
-+                        np.any(query_lbs == 0) or len(np.unique(query_lbs)) > 1
-+                    ):
-+                        spans_prerotate_safe = False
++                    spill_src.append((i, _spill_source(req, req_len)))
++            if spill_log:
++                self._log_lb_spill(
++                    attn_lb, alt_lb, spill_src, req_kv_starts, num_computed,
++                    seq_lens_arr, noclip,
++                )
++            self._spans_no_raw_k = not (attn_lb & SPANS_LB_MASK).any()
 +            self._attn_lb_np, self._req_kv_starts_np = attn_lb, req_kv_starts
-+            self._spans_prerotate_safe = spans_prerotate_safe
 +            # copy the packed bounds into the strided buffer in place
 +            stride = self._spans_lb_stride
 +            staging = self._spans_lb_staging
@@ -6222,6 +7371,9 @@ index b958ef79d0..10e03c078a 100644
 +                lb_gpu[base : base + n].copy_(
 +                    staging[base : base + n], non_blocking=True
 +                )
++            if stride:  # the fast path must rewrite every row it meets next
++                self._spans_lb_owner = [None] * self.max_num_reqs
++                self._spans_lb_dirty = [True] * self.max_num_reqs
 +
 +        # QCFUSE: probe prefill rows only (nsched > 1), which always run eager
 +        if self.qcfuse_capturer is not None:
@@ -6243,15 +7395,16 @@ index b958ef79d0..10e03c078a 100644
 +                rows = req.spanfuse_query_rows or qcfuse.QCFUSE_MAX_QUERY_TOKENS
 +                q_start = max(q_end - nsched, q_end - rows)
 +                q_pos0 = computed + nsched - (q_end - q_start)
++                ctx = min(ctx, self.max_model_len)
++                raw = None
++                if getattr(self, "_attn_lb_np", None) is not None:
++                    rs = int(self._req_kv_starts_np[i])
++                    n_lb = max(ctx, computed + nsched)  # keys and query rows
++                    raw = torch.from_numpy(
++                        self._attn_lb_np[rs : rs + n_lb] & SPANS_LB_MASK
++                    ).to(self.device, non_blocking=True)
 +                descs.append(
-+                    (
-+                        i,
-+                        q_start,
-+                        q_end,
-+                        min(ctx, self.max_model_len),
-+                        req.spanfuse_span_blocks,
-+                        q_pos0,
-+                    )
++                    (i, q_start, q_end, ctx, req.spanfuse_span_blocks, q_pos0, raw)
 +                )
 +                if req.is_spanfuse_probe:
 +                    logger.info(
@@ -6265,7 +7418,7 @@ index b958ef79d0..10e03c078a 100644
          # Calculate M-RoPE positions.
          # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
          if self.uses_mrope:
-@@ -1998,6 +2222,15 @@ class GPUModelRunner(
+@@ -1998,6 +2404,15 @@ class GPUModelRunner(
  
                  output_idx += num_sched
  
@@ -6281,7 +7434,7 @@ index b958ef79d0..10e03c078a 100644
          # Prepare the attention metadata.
          self.query_start_loc.np[0] = 0
          self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
-@@ -2120,6 +2353,29 @@ class GPUModelRunner(
+@@ -2120,6 +2535,28 @@ class GPUModelRunner(
              self.query_start_loc.gpu[: num_reqs + 1],
              self.positions[:total_num_scheduled_tokens],
          )
@@ -6305,13 +7458,12 @@ index b958ef79d0..10e03c078a 100644
 +        ):
 +            pos_slice = self.positions[:total_num_scheduled_tokens]
 +            sched_kv_indices = self._req_kv_starts_gpu[req_indices_gpu] + pos_slice
-+            pos_slice -= self._attn_lower_bounds_gpu[sched_kv_indices].to(
-+                pos_slice.dtype
-+            )
++            lb_word = self._attn_lower_bounds_gpu[sched_kv_indices].to(pos_slice.dtype)
++            pos_slice -= lb_word & SPANS_LB_MASK  # Q and K at p - L
  
          # Copy the tensors to the GPU.
          self._prepare_input_ids(
-@@ -2268,6 +2524,35 @@ class GPUModelRunner(
+@@ -2268,6 +2705,35 @@ class GPUModelRunner(
          block_table_gid_0 = _get_block_table(0)
          slot_mapping_gid_0 = slot_mappings[0]
  
@@ -6347,7 +7499,7 @@ index b958ef79d0..10e03c078a 100644
          if self.routed_experts_initialized:
              # Copy this step's attention slot_mapping into our private
              # device buffer. The shared ``slot_mappings[attn_gid]`` is
-@@ -2341,9 +2626,14 @@ class GPUModelRunner(
+@@ -2341,9 +2807,14 @@ class GPUModelRunner(
              block_table_tensor=block_table_gid_0,
              slot_mapping=slot_mapping_gid_0,
              causal=True,
@@ -6358,11 +7510,11 @@ index b958ef79d0..10e03c078a 100644
              mm_req_doc_ranges=req_doc_ranges,
 +            attn_lower_bounds=getattr(self, "_attn_lower_bounds_gpu", None),
 +            req_kv_starts=getattr(self, "_req_kv_starts_gpu", None),
-+            spans_prerotate_safe=getattr(self, "_spans_prerotate_safe", True),
++            spans_no_raw_k=getattr(self, "_spans_no_raw_k", False),
          )
  
          if self.dcp_world_size > 1:
-@@ -3754,6 +4044,186 @@ class GPUModelRunner(
+@@ -3754,6 +4225,226 @@ class GPUModelRunner(
          finally:
              self.prepare_inputs_event.record()
  
@@ -6546,10 +7698,50 @@ index b958ef79d0..10e03c078a 100644
 +
 +            traceback.print_exc()
 +
++    def _spanshift_dump(self, pairs: list[tuple]) -> None:
++        """SPANSHIFT: save each swapped block's blind and repaired K/V, per layer."""
++        from vllm.distributed import get_tensor_model_parallel_rank
++
++        if get_tensor_model_parallel_rank() != 0:
++            return
++        ctx = self.compilation_config.static_forward_context
++        layers = {}
++        for name, layer in ctx.items():
++            kv = getattr(layer, "kv_cache", None)
++            if isinstance(kv, list):
++                kv = kv[0] if kv else None
++            if not isinstance(kv, torch.Tensor) or kv.dim() != 5:
++                continue
++            layers[name] = (kv, getattr(layer, "spans_cos_sin_cache", None),
++                            getattr(layer, "spans_rotary_dim", 0))
++        for rid, starts, idx, old, new, src, toks in pairs:
++            o = torch.tensor(old, device=self.device)
++            n = torch.tensor(new, device=self.device)
++            bs = self.cache_config.block_size
++            out = {"req": rid, "span_starts": starts, "block_idx": idx, "src": src,
++                   "tokens": toks,
++                   "block_size": bs, "layers": {}, "rope": {}}
++            npos = (max(idx) + 1) * bs  # span-local positions are below this
++            for name, (kv, csc, rdim) in layers.items():
++                # blocks-first (n_blocks, 2, bs, heads, d) or K/V-first
++                bf = kv.shape[1] == 2
++                blind = kv[o] if bf else kv[:, o].transpose(0, 1)
++                fresh = kv[n] if bf else kv[:, n].transpose(0, 1)
++                key = None if csc is None else csc.data_ptr()
++                if key is not None and key not in out["rope"]:
++                    out["rope"][key] = csc[:npos].cpu()
++                out["layers"][name] = {"blind": blind.cpu(), "fresh": fresh.cpu(),
++                                       "rotary_dim": rdim, "rope": key}
++            os.makedirs(envs.VLLM_V1_SPANS_SHIFT_DUMP, exist_ok=True)
++            torch.save(out, os.path.join(envs.VLLM_V1_SPANS_SHIFT_DUMP,
++                                         f"{rid}_{idx[0]}.pt"))
++            logger.info("SpanShift dump %s: %d blocks, %d layers", rid, len(idx),
++                        len(layers))
++
      def _model_forward(
          self,
          input_ids: torch.Tensor | None = None,
-@@ -3829,6 +4299,18 @@ class GPUModelRunner(
+@@ -3829,6 +4520,18 @@ class GPUModelRunner(
          torch.Tensor | None,
          CUDAGraphStat | None,
      ]:
@@ -6568,10 +7760,13 @@ index b958ef79d0..10e03c078a 100644
          uniform_decode = self._is_uniform_decode(
              max_num_scheduled_tokens=max_num_scheduled_tokens,
              uniform_decode_query_len=self.uniform_decode_query_len,
-@@ -4325,6 +4807,11 @@ class GPUModelRunner(
+@@ -4325,6 +5028,14 @@ class GPUModelRunner(
                  **model_kwargs,
              )
  
++        if scheduler_output.spanshift_pairs and envs.VLLM_V1_SPANS_SHIFT_DUMP:
++            self._spanshift_dump(scheduler_output.spanshift_pairs)
++
 +        # === DEBUG: KV Cache Hash ===
 +        if self._should_debug_kv_hash():
 +            self._debug_kv_cache_hash(scheduler_output)
@@ -6580,7 +7775,7 @@ index b958ef79d0..10e03c078a 100644
          with record_function_or_nullcontext("gpu_model_runner: postprocess"):
              if self.use_aux_hidden_state_outputs:
                  # True when EAGLE 3 is used.
-@@ -4383,6 +4870,9 @@ class GPUModelRunner(
+@@ -4383,6 +5094,9 @@ class GPUModelRunner(
                  assert broadcasted is not None
                  logits = broadcasted["logits"]
  
@@ -6590,7 +7785,7 @@ index b958ef79d0..10e03c078a 100644
          self.execute_model_state = ExecuteModelState(
              scheduler_output,
              logits,
-@@ -4606,6 +5096,17 @@ class GPUModelRunner(
+@@ -4606,6 +5320,17 @@ class GPUModelRunner(
          kv_connector_output = self.kv_connector_output
          self.kv_connector_output = None
  
@@ -6600,7 +7795,7 @@ index b958ef79d0..10e03c078a 100644
 +            buf = self.qcfuse_capturer.buffer
 +            qcfuse_importance = {
 +                self.input_batch.req_ids[row]: buf[row, :ctx].tolist()
-+                for row, _, _, ctx, _, _ in self._qcfuse_descs
++                for row, _, _, ctx, *_ in self._qcfuse_descs
 +            }
 +            self._qcfuse_descs = []
 +            self.qcfuse_capturer.end_step()
@@ -6608,7 +7803,7 @@ index b958ef79d0..10e03c078a 100644
          with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
              output = ModelRunnerOutput(
                  req_ids=req_ids_output_copy,
-@@ -4620,8 +5121,18 @@ class GPUModelRunner(
+@@ -4620,8 +5345,18 @@ class GPUModelRunner(
                  num_nans_in_logits=num_nans_in_logits,
                  cudagraph_stats=cudagraph_stats,
                  routed_experts=None,
@@ -6627,7 +7822,7 @@ index b958ef79d0..10e03c078a 100644
          if not self.use_async_scheduling:
              if self.routed_experts_initialized:
                  # Sync path: D2H was issued in ``_bookkeeping_sync`` and
-@@ -6582,6 +7093,12 @@ class GPUModelRunner(
+@@ -6582,6 +7317,12 @@ class GPUModelRunner(
  
      @instrument(span_name="Capture model")
      def capture_model(self) -> int:
