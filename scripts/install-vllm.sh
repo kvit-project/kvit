@@ -24,5 +24,8 @@ fi
 
 # The patch only touches Python and Triton, so the upstream prebuilt kernels work.
 cd "$DEST"
-VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
+# Pin the kernels to VLLM_SHA; a shallow clone otherwise falls back to the
+# latest nightly, whose libraries do not match this source.
+VLLM_PRECOMPILED_WHEEL_COMMIT="$VLLM_SHA" VLLM_USE_PRECOMPILED=1 \
+  uv pip install -e . --torch-backend=auto
 uv pip install -e "$ROOT"
