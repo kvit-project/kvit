@@ -42,7 +42,7 @@ so they cannot be shipped as a vLLM plugin.
 | | |
 |---|---|
 | Upstream vLLM | [`a7fdfeef72323eb3db6f0620e4ea200290d0ca5a`](https://github.com/vllm-project/vllm/commit/a7fdfeef72323eb3db6f0620e4ea200290d0ca5a) (between v0.23.0 and v0.24.0rc1) |
-| Patch source | development fork, branch `feature/spanshift` at `d063708018` |
+| Patch source | development fork, branch `feature/spans-pin-span-blocks` at `3d0e65fee5` |
 
 The patch only applies to that commit. Other vLLM versions are untested.
 
@@ -95,6 +95,14 @@ returned.
 The PIC path lives in the V1 GPU model runner and the Triton attention backend,
 so both are required. Other repair policies are selected with
 `--gap-policy-name` (`span_aware`, `qcfuse`, `neighbor_aware`, `spanfuse`).
+
+Under KV memory pressure vLLM evicts the least recently used blocks, and a span
+that was evicted is prefilled again by its next reader. Every unprefix span is a
+slice of a tracked repo file, so set `VLLM_V1_SPANS_PIN_FRACTION=0.5` to keep
+shared span blocks out of the eviction queue until they fill that share of the
+KV pool (default `0`, off). Pins are not released; past the cap span blocks are
+evictable again.
+
 All knobs are `VLLM_V1_SPANS_*` environment variables, documented in
 `build/vllm/vllm/envs.py`. The PIC tests run with
 `build/vllm/scripts/run_spans_tests.sh`, and the proxy tests with
