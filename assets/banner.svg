@@ -3,7 +3,7 @@ text{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,san
 .t{font-size:30px;font-weight:700}
 .s{font-size:15px;fill:#59636e}
 .l{font-size:22px}
-.b{font-size:13px;font-weight:600;fill:#1f2328}
+.b{font-size:15px;font-weight:600;fill:#1f2328}
 .p{fill:#63b06b} .r{fill:#65aee6} .n{fill:#e8e8e8}
 .bp{fill:#fff} .br{fill:#fff} .bn{fill:#59636e}
 .k{font-size:16px;font-weight:700} .dim{fill:#59636e;font-weight:400}
