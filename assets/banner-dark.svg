@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="150" viewBox="0 0 1000 150"><style>
+text{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;fill:#1f2328}
+.t{font-size:36px;font-weight:700}
+.s{font-size:15px;fill:#59636e}
+.l{font-size:27px}
+.b{font-size:19px;font-weight:600;fill:#1f2328}
+.p{fill:#63b06b} .r{fill:#65aee6} .n{fill:#e8e8e8}
+.bp{fill:#fff} .br{fill:#fff} .bn{fill:#59636e}
+.k{font-size:16px;font-weight:700} .dim{fill:#59636e;font-weight:400}
+.ln{stroke:#d1d9e0;stroke-width:1}
+text,.b{fill:#e6edf3} .s,.bn,.dim{fill:#9198a1}
+.p{fill:#3f8f47} .r{fill:#3d8fd1} .n{fill:#2d333b}
+.ln{stroke:#3d444d}
+</style><rect class="p" x="640" y="25" width="28" height="28" rx="6"/><rect class="p" x="674" y="25" width="28" height="28" rx="6"/><rect class="p" x="708" y="25" width="28" height="28" rx="6"/><rect class="n" x="742" y="25" width="28" height="28" rx="6"/><rect class="r" x="776" y="25" width="28" height="28" rx="6"/><rect class="r" x="810" y="25" width="28" height="28" rx="6"/><rect class="n" x="844" y="25" width="28" height="28" rx="6"/><rect class="n" x="878" y="25" width="28" height="28" rx="6"/><rect class="r" x="912" y="25" width="28" height="28" rx="6"/><rect class="n" x="946" y="25" width="28" height="28" rx="6"/><rect class="p" x="640" y="59" width="28" height="28" rx="6"/><rect class="p" x="674" y="59" width="28" height="28" rx="6"/><rect class="p" x="708" y="59" width="28" height="28" rx="6"/><rect class="n" x="742" y="59" width="28" height="28" rx="6"/><rect class="n" x="776" y="59" width="28" height="28" rx="6"/><rect class="n" x="810" y="59" width="28" height="28" rx="6"/><rect class="r" x="844" y="59" width="28" height="28" rx="6"/><rect class="r" x="878" y="59" width="28" height="28" rx="6"/><rect class="n" x="912" y="59" width="28" height="28" rx="6"/><rect class="r" x="946" y="59" width="28" height="28" rx="6"/><rect class="p" x="640" y="93" width="28" height="28" rx="6"/><rect class="p" x="674" y="93" width="28" height="28" rx="6"/><rect class="p" x="708" y="93" width="28" height="28" rx="6"/><rect class="r" x="742" y="93" width="28" height="28" rx="6"/><rect class="n" x="776" y="93" width="28" height="28" rx="6"/><rect class="n" x="810" y="93" width="28" height="28" rx="6"/><rect class="r" x="844" y="93" width="28" height="28" rx="6"/><rect class="r" x="878" y="93" width="28" height="28" rx="6"/><rect class="n" x="912" y="93" width="28" height="28" rx="6"/><rect class="n" x="946" y="93" width="28" height="28" rx="6"/><text x="36" y="82" style="font-size:64px;font-weight:800;letter-spacing:-2px">unprefix</text><text class="s" x="40" y="118" style="font-size:19px">KV cache reuse for coding agents, at any position in the prompt</text></svg>

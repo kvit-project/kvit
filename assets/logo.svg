@@ -8,9 +8,4 @@ text{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,san
 .bp{fill:#fff} .br{fill:#fff} .bn{fill:#59636e}
 .k{font-size:16px;font-weight:700} .dim{fill:#59636e;font-weight:400}
 .ln{stroke:#d1d9e0;stroke-width:1}
-@media (prefers-color-scheme:dark){
-text,.b{fill:#e6edf3} .s,.bn,.dim{fill:#9198a1}
-.p{fill:#3f8f47} .r{fill:#3d8fd1} .n{fill:#2d333b}
-.ln{stroke:#3d444d}
-}
 </style><rect class="p" x="24" y="24" width="144" height="144" rx="28"/><rect class="p" x="184" y="24" width="144" height="144" rx="28"/><rect class="p" x="344" y="24" width="144" height="144" rx="28"/><rect class="n" x="24" y="184" width="144" height="144" rx="28"/><rect class="r" x="184" y="184" width="144" height="144" rx="28"/><rect class="r" x="344" y="184" width="144" height="144" rx="28"/><rect class="r" x="24" y="344" width="144" height="144" rx="28"/><rect class="n" x="184" y="344" width="144" height="144" rx="28"/><rect class="r" x="344" y="344" width="144" height="144" rx="28"/></svg>

@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="assets/banner.svg" alt="unprefix" width="100%">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/banner-dark.svg">
+    <img src="assets/banner.svg" alt="unprefix" width="100%">
+  </picture>
 </p>
 
 unprefix runs a local vLLM that caches the KV of the parts of a local Git
@@ -15,7 +18,10 @@ slice of a file tracked in the repo, and its KV is stored the first time an
 agent reads it.
 
 <p align="center">
-  <img src="assets/span-reuse.svg" alt="Conventional prefix caching reuses only the shared prefix; unprefix also reuses spans that appear later in the prompt" width="85%">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/span-reuse-dark.svg">
+    <img src="assets/span-reuse.svg" alt="Conventional prefix caching reuses only the shared prefix; unprefix also reuses spans that appear later in the prompt" width="85%">
+  </picture>
 </p>
 
 ## Multi-agent workloads
@@ -27,7 +33,10 @@ also shares every file one agent has already read with all the others, in
 whatever order they read it.
 
 <p align="center">
-  <img src="assets/multi-agent.svg" alt="OpenCode, Codex and Aider read router.py, cache.py and config.py in different orders. Prefix caching reuses only each agent's own system prompt; unprefix also reuses the files earlier agents read" width="100%">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/multi-agent-dark.svg">
+    <img src="assets/multi-agent.svg" alt="OpenCode, Codex and Aider read router.py, cache.py and config.py in different orders. Prefix caching reuses only each agent's own system prompt; unprefix also reuses the files earlier agents read" width="100%">
+  </picture>
 </p>
 
 <sub>Block counts in the figures are illustrative, not measurements.</sub>
