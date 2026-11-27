@@ -1,8 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/banner-dark.svg">
-    <img src="assets/banner.svg" alt="unprefix" width="100%">
-  </picture>
+  <img src="assets/banner.svg" alt="unprefix" width="100%">
 </p>
 
 unprefix runs a local vLLM that caches the KV of the parts of a local Git
@@ -18,25 +15,20 @@ slice of a file tracked in the repo, and its KV is stored the first time an
 agent reads it.
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/span-reuse-dark.svg">
-    <img src="assets/span-reuse.svg" alt="Conventional prefix caching reuses only the shared prefix; unprefix also reuses spans that appear later in the prompt" width="85%">
-  </picture>
+  <img src="assets/span-reuse.svg" alt="Conventional prefix caching reuses only the shared prefix; unprefix also reuses spans that appear later in the prompt" width="85%">
 </p>
 
 ## Multi-agent workloads
 
-Different agents working on the same repository read the same files, but each
-one has its own system prompt and task. Prefix caching reuses each agent's
-system prompt from its own earlier turns and nothing across agents. unprefix
-also shares every file one agent has already read with all the others, in
-whatever order they read it.
+A swarm of agents working on the same repository keeps reading the same files,
+but each agent has its own system prompt and task. Prefix caching reuses each
+agent's system prompt from its own earlier turns and nothing across agents.
+unprefix keeps one span cache for the whole swarm: the first agent to read a
+file computes it, and every other agent reuses it, in whatever order it reads
+it.
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/multi-agent-dark.svg">
-    <img src="assets/multi-agent.svg" alt="OpenCode, Codex and Aider read router.py, cache.py and config.py in different orders. Prefix caching reuses only each agent's own system prompt; unprefix also reuses the files earlier agents read" width="100%">
-  </picture>
+  <img src="assets/multi-agent.svg" alt="Six agents share one span KV cache of repository files. The first agent to read a file computes it, and the others reuse it" width="100%">
 </p>
 
 <sub>Block counts in the figures are illustrative, not measurements.</sub>
