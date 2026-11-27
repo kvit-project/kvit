@@ -21,12 +21,13 @@ agent reads it.
 ## Multi-agent workloads
 
 Different agents working on the same repository read the same files, but each
-one has its own system prompt and task, so prefix caching shares nothing between
-them. unprefix shares every file one agent has already read with all the
-others, in whatever order they read it.
+one has its own system prompt and task. Prefix caching reuses each agent's
+system prompt from its own earlier turns and nothing across agents. unprefix
+also shares every file one agent has already read with all the others, in
+whatever order they read it.
 
 <p align="center">
-  <img src="assets/multi-agent.svg" alt="OpenCode, Codex and Aider read router.py, cache.py and config.py in different orders. Prefix caching reuses nothing across them; unprefix reuses the files earlier agents read" width="100%">
+  <img src="assets/multi-agent.svg" alt="OpenCode, Codex and Aider read router.py, cache.py and config.py in different orders. Prefix caching reuses only each agent's own system prompt; unprefix also reuses the files earlier agents read" width="100%">
 </p>
 
 <sub>Block counts in the figures are illustrative, not measurements.</sub>
