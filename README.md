@@ -31,8 +31,6 @@ it.
   <img src="assets/multi-agent.svg" alt="Six agents share one span KV cache of repository files. The first agent to read a file computes it, and the others reuse it" width="100%">
 </p>
 
-<sub>Block counts in the figures are illustrative, not measurements.</sub>
-
 ## How it works
 
 The engine changes live in `patches/vllm-pic.patch`. They touch the scheduler, the
