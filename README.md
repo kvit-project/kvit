@@ -29,8 +29,8 @@ Needs a CUDA machine, `git` and [`uv`](https://docs.astral.sh/uv/), inside an
 activated virtualenv.
 
 ```bash
-git clone https://github.com/kvit-project/kvit.git
-cd kvit
+git clone https://github.com/unprefix-project/unprefix.git
+cd unprefix
 ./scripts/install-vllm.sh
 ```
 
