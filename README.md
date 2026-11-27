@@ -2,10 +2,6 @@
   <img src="assets/banner.svg" alt="unprefix" width="100%">
 </p>
 
-<p align="center">
-  <img src="assets/span-reuse.svg" alt="Conventional prefix caching reuses only the shared prefix; unprefix also reuses spans that appear later in the prompt" width="85%">
-</p>
-
 unprefix runs a local vLLM that caches the KV of the parts of a local Git
 repository an agent reads, and reuses them at any position in later prompts
 (position-independent caching, PIC). Conventional prefix caching stops at the
@@ -17,6 +13,10 @@ blocks per span is recomputed to repair cross-span attention.
 Nothing is cached ahead of time. A tool output becomes a span only when it is a
 slice of a file tracked in the repo, and its KV is stored the first time an
 agent reads it.
+
+<p align="center">
+  <img src="assets/span-reuse.svg" alt="Conventional prefix caching reuses only the shared prefix; unprefix also reuses spans that appear later in the prompt" width="85%">
+</p>
 
 ## Multi-agent workloads
 
