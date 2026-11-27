@@ -67,11 +67,16 @@ Start the patched vLLM:
 ```bash
 VLLM_V1_SPANS_ENABLED=True \
 VLLM_V1_SPANS_SPANFUSE_ENABLE=True \
+VLLM_V1_SPANS_QCFUSE_CRITICAL_LAYERS=<layers> \
 VLLM_USE_V2_MODEL_RUNNER=0 \
 vllm serve <model> --attention-backend TRITON_ATTN --block-size 16 \
   --enable-prefix-caching --no-async-scheduling \
   --enable-auto-tool-choice --tool-call-parser <parser>
 ```
+
+`<layers>` is a comma-separated list of layer indices that the SpanFuse importance
+probe runs on, for example a middle layer (`18` for a 36-layer model). vLLM does
+not start without it.
 
 Then put the proxy in front of it and point the agent's OpenAI base URL at
 `http://127.0.0.1:8100/v1`:
@@ -106,7 +111,7 @@ evictable again.
 All knobs are `VLLM_V1_SPANS_*` environment variables, documented in
 `build/vllm/vllm/envs.py`. The PIC tests run with
 `build/vllm/scripts/run_spans_tests.sh`, and the proxy tests with
-`python -m pytest tests`.
+`python -m pytest tests` (install `pytest` first).
 
 ## Regenerating the patch
 
