@@ -1,14 +1,37 @@
-# KVit
+<p align="center">
+  <img src="assets/banner.svg" alt="unprefix" width="100%">
+</p>
 
-KVit runs a local vLLM that caches the KV of the parts of a local Git repository
-an agent reads, and reuses them at any position in later prompts
-(position-independent caching, PIC). A file slice that shows up again in a
-different order or after a different prefix is not prefilled again; only a small
-set of blocks per span is recomputed to repair cross-span attention.
+<p align="center">
+  <img src="assets/span-reuse.svg" alt="Conventional prefix caching reuses only the shared prefix; unprefix also reuses spans that appear later in the prompt" width="85%">
+</p>
+
+unprefix runs a local vLLM that caches the KV of the parts of a local Git
+repository an agent reads, and reuses them at any position in later prompts
+(position-independent caching, PIC). Conventional prefix caching stops at the
+first token that differs, so a file read after a different task message is
+prefilled again. With unprefix, a file slice that shows up again in a different
+order or after a different prefix is not prefilled again; only a small set of
+blocks per span is recomputed to repair cross-span attention.
 
 Nothing is cached ahead of time. A tool output becomes a span only when it is a
-slice of a file tracked in the repo, and its KV is stored the first time the
+slice of a file tracked in the repo, and its KV is stored the first time an
 agent reads it.
+
+## Multi-agent workloads
+
+Agents working on the same repository read the same files, but each one has its
+own task, so their prompts diverge right after the shared system prompt. Prefix
+caching only shares that system prompt. unprefix shares every file one agent
+has already read with all the others, in whatever order they read it.
+
+<p align="center">
+  <img src="assets/multi-agent.svg" alt="Three agents read router.py, cache.py and config.py in different orders. Prefix caching reuses only the system prompt; unprefix also reuses the files earlier agents read" width="100%">
+</p>
+
+<sub>Block counts in the figures are illustrative, not measurements.</sub>
+
+## How it works
 
 The engine changes live in `patches/vllm-pic.patch`. They touch the scheduler, the
 KV-cache manager, the Triton attention backend, RoPE handling and the model runner,
@@ -35,7 +58,7 @@ cd unprefix
 ```
 
 This clones vLLM into `build/vllm`, applies the patch, installs it in editable
-mode with the prebuilt upstream kernels, and installs the `kvit` command.
+mode with the prebuilt upstream kernels, and installs the `unprefix` command.
 
 ## Run
 
@@ -54,7 +77,7 @@ Then put the proxy in front of it and point the agent's OpenAI base URL at
 `http://127.0.0.1:8100/v1`:
 
 ```bash
-kvit serve --repo /path/to/project --vllm-url http://localhost:8000
+unprefix serve --repo /path/to/project --vllm-url http://localhost:8000
 ```
 
 For each `/v1/chat/completions` request, the proxy renders the chat template,

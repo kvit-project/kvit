@@ -1,6 +1,6 @@
 import subprocess
 
-from kvit.proxy import RepoIndex, layout, split_prompt
+from unprefix.proxy import RepoIndex, layout, split_prompt
 
 
 def test_layout_aligns_spans_and_following_text():

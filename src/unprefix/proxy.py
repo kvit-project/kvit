@@ -145,7 +145,7 @@ def create_app(repo: RepoIndex, vllm_url: str, block_size: int) -> FastAPI:
             for t, s in split_prompt(text, spans)
         ]
         ids, starts, crosses = layout(pieces, block_size, pad_id)
-        print(f"kvit: {len(starts)} spans, {len(ids)} prompt tokens", flush=True)
+        print(f"unprefix: {len(starts)} spans, {len(ids)} prompt tokens", flush=True)
 
         req = {k: v for k, v in body.items() if k not in CHAT_ONLY}
         if "max_completion_tokens" in req:
@@ -223,7 +223,7 @@ def create_app(repo: RepoIndex, vllm_url: str, block_size: int) -> FastAPI:
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="kvit")
+    parser = argparse.ArgumentParser(prog="unprefix")
     sub = parser.add_subparsers(dest="cmd", required=True)
     serve = sub.add_parser("serve", help="OpenAI-compatible proxy for an agent")
     serve.add_argument("--repo", required=True, help="local git repository")
